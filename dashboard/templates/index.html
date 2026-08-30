@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Industrial Mind — Security Operations Dashboard</title>
+    
+    <!-- Google Fonts: Inter & JetBrains Mono -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+    <!-- MAIN APP CONTAINER -->
+    <div class="app-container">
+
+        <!-- MINIMAL HEADER -->
+        <header class="app-header">
+            <div class="brand">
+                <span class="brand-title">INDUSTRIAL MIND</span>
+                <span class="brand-sub">Industrial Cybersecurity &amp; Physical Safety Monitoring System</span>
+            </div>
+
+            <div class="header-actions">
+                <div class="status-indicator">
+                    <span class="status-dot"></span>
+                    <span>System Status: <strong>ONLINE</strong></span>
+                </div>
+
+                <div class="action-buttons">
+                    <button id="btn-trigger-attack" class="btn btn-danger" title="Inject simulated threat event">
+                        <i class="fa-solid fa-triangle-exclamation"></i> Inject Attack
+                    </button>
+                    <button id="btn-reset-data" class="btn btn-secondary" title="Reset metrics baseline">
+                        <i class="fa-solid fa-rotate"></i> Reset
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- 1. SUMMARY CARDS (3 CARDS ONLY) -->
+        <section class="summary-cards">
+            <div class="card summary-card">
+                <span class="card-label">TOTAL COMMANDS</span>
+                <span class="card-value" id="kpi-total">0</span>
+                <span class="card-sub">SCADA &amp; PLC Traffic</span>
+            </div>
+
+            <div class="card summary-card pass">
+                <span class="card-label">PASS</span>
+                <span class="card-value pass-text" id="kpi-pass">0</span>
+                <span class="card-sub">Approved &amp; Verified</span>
+            </div>
+
+            <div class="card summary-card drop">
+                <span class="card-label">DROP</span>
+                <span class="card-value drop-text" id="kpi-drop">0</span>
+                <span class="card-sub">Blocked / Threats Dropped</span>
+            </div>
+        </section>
+
+        <!-- 2. MAIN SECTION: DUAL DYNAMIC ACTIVITY TABLES (SIDE BY SIDE 50/50) -->
+        <section class="activity-dual-grid">
+            
+            <!-- LEFT PANEL: SCADA -> PLC SECURITY ACTIVITY -->
+            <div class="card activity-card">
+                <div class="card-header">
+                    <h2><i class="fa-solid fa-arrow-right title-icon"></i> SCADA ➔ PLC SECURITY ACTIVITY</h2>
+                    <span class="badge-tag">Outbound Commands</span>
+                </div>
+
+                <div class="table-wrapper">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>TIME</th>
+                                <th>TRANSACTION ID</th>
+                                <th>COMMAND</th>
+                                <th>VERDICT</th>
+                                <th>REASON / EXPLANATION</th>
+                                <th>LATENCY</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tbody-scada-plc">
+                            <!-- Dynamic SCADA -> PLC Rows -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- RIGHT PANEL: PLC -> SCADA SECURITY ACTIVITY -->
+            <div class="card activity-card">
+                <div class="card-header">
+                    <h2><i class="fa-solid fa-arrow-left title-icon"></i> PLC ➔ SCADA SECURITY ACTIVITY</h2>
+                    <span class="badge-tag">Inbound Telemetry / Responses</span>
+                </div>
+
+                <div class="table-wrapper">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>TIME</th>
+                                <th>TRANSACTION ID</th>
+                                <th>STATUS / RESPONSE</th>
+                                <th>VERDICT</th>
+                                <th>REASON / EXPLANATION</th>
+                                <th>LATENCY</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tbody-plc-scada">
+                            <!-- Dynamic PLC -> SCADA Rows -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+        </section>
+
+        <!-- 3. BOTTOM SECTION: TELEMETRY & CPU LOAD -->
+        <div class="bottom-grid">
+            
+            <!-- LEFT: LIVE PLC TELEMETRY -->
+            <section class="card telemetry-card">
+                <div class="card-header">
+                    <h2>Live PLC Telemetry</h2>
+                </div>
+
+                <div class="telemetry-list">
+                    <div class="telemetry-item">
+                        <div class="telemetry-header">
+                            <span>Tank Pressure</span>
+                            <span class="telemetry-val" id="val-pressure">65 PSI</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="bar-pressure" style="width: 65%;"></div>
+                        </div>
+                        <span class="range-info">Safe range: 0 – 100 PSI</span>
+                    </div>
+
+                    <div class="telemetry-item">
+                        <div class="telemetry-header">
+                            <span>Conveyor Speed</span>
+                            <span class="telemetry-val" id="val-speed">80 RPM</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill warning" id="bar-speed" style="width: 66.6%;"></div>
+                        </div>
+                        <span class="range-info">Safe range: 0 – 120 RPM</span>
+                    </div>
+
+                    <div class="telemetry-item">
+                        <div class="telemetry-header">
+                            <span>Cooling Valve</span>
+                            <span class="telemetry-val" id="val-valve">45°</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill info" id="bar-valve" style="width: 50%;"></div>
+                        </div>
+                        <span class="range-info">Safe range: 0 – 90°</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- RIGHT: PLC CPU LOAD OVER TIME -->
+            <section class="card cpu-card">
+                <div class="card-header">
+                    <h2>PLC CPU Load Over Time</h2>
+                    <span class="cpu-stat">Current Load: <strong id="val-cpu-load">32%</strong></span>
+                </div>
+
+                <div class="chart-wrapper">
+                    <canvas id="cpuLoadChart"></canvas>
+                </div>
+            </section>
+
+        </div>
+
+    </div>
+
+    <!-- Application Controller -->
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
