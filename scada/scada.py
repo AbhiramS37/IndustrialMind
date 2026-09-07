@@ -10,7 +10,7 @@ Usage (standalone test — point directly at Sharon's plc.py):
     python -m scada.scada --host 127.0.0.1 --port 5020
 
 Usage (through middleware — normal operation):
-    python -m scada.scada --host 127.0.0.1 --port 5502
+    python -m scada.scada --host 127.0.0.1 --port 5021
 """
 
 import argparse
@@ -132,7 +132,7 @@ def run_operator_loop(host: str = "127.0.0.1", port: int = 5502):
 
     Args:
         host: Target server host.
-        port: Target server port.  5502 = middleware, 5020 = PLC directly.
+        port: Target server port.  5021 = middleware, 5020 = PLC directly.
     """
     print(f"[SCADA] Connecting to {host}:{port} …")
     client = ModbusTcpClient(host=host, port=port)
@@ -166,7 +166,7 @@ def run_operator_loop(host: str = "127.0.0.1", port: int = 5502):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Industrial Mind SCADA client")
     parser.add_argument("--host", default="127.0.0.1", help="Target host")
-    parser.add_argument("--port", type=int, default=5502,
-                        help="Target port (5502=middleware, 5020=PLC direct)")
+    parser.add_argument("--port", type=int, default=5021,
+                        help="Target port (5021=middleware, 5020=PLC direct)")
     args = parser.parse_args()
     run_operator_loop(args.host, args.port)
