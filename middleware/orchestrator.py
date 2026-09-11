@@ -5,11 +5,30 @@ On the upstream (PLC -> SCADA) path, cyber_verdict will be None — only the
 Physical Agent runs there, per the team's design.
 """
 
+import json
+import threading
 import time
+import urllib.request
 
 from docs.interfaces import make_decision
 
 _decision_log = []
+
+
+def _forward_decision_to_dashboard(payload: dict):
+    def _send():
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                "http://127.0.0.1:5050/api/security-event",
+                data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=1.0)
+        except Exception:
+            pass  # Silently ignore forwarding errors so middleware operation is never affected
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def decide(cyber_verdict: dict | None, physical_verdict: dict, start_time: float = None) -> dict:
@@ -32,7 +51,19 @@ def decide(cyber_verdict: dict | None, physical_verdict: dict, start_time: float
 
     decision = make_decision(tx_id, verdict, reason, latency_ms, direction)
     _decision_log.append(decision)
+
+    payload = {
+        "tx_id": decision["tx_id"],
+        "direction": "scada_to_plc" if direction == "downstream" else "plc_to_scada",
+        "verdict": decision["verdict"],
+        "reason": decision["reason"],
+        "latency_ms": decision["latency_ms"],
+        "command": physical_verdict.get("command", "MODBUS_COMMAND"),
+    }
+    _forward_decision_to_dashboard(payload)
+
     return decision
+
 
 
 def get_log() -> list:
