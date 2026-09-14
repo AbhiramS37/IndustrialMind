@@ -265,3 +265,4 @@ def check_feedback(commanded_value: float, reported_value: float, register: int)
         )
 
     return make_verdict("", True, "OK", "physical")
+

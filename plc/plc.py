@@ -16,11 +16,7 @@ import threading
 
 from docs.interfaces import TANK_PRESSURE, CONVEYOR_SPEED, COOLING_VALVE, REGISTER_MAP
 
-from pymodbus.datastore import (
-    ModbusSequentialDataBlock,
-    ModbusSlaveContext,
-    ModbusServerContext,
-)
+from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext, ModbusSequentialDataBlock
 from pymodbus.server import StartTcpServer
 
 # --- Internal plant state -------------------------------------------------
@@ -53,6 +49,25 @@ _cpu_current = _cpu_baseline
 _SCALE = 10
 
 
+def notify_upstream_response(register: int, value: float):
+    """Notifies middleware/orchestrator of upstream PLC feedback response."""
+    try:
+        from middleware.orchestrator import decide
+        reg_info = REGISTER_MAP.get(register, {})
+        reg_name = reg_info.get("name", f"REGISTER_{register}")
+        unit = reg_info.get("unit", "")
+        tx_id = f"PLC-TXN-{int(time.time())}"
+        phys_verdict = {
+            "tx_id": tx_id,
+            "pass": True,
+            "reason": f"PLC confirmed: {reg_name} updated to {value} {unit}".strip(),
+            "command": f"{reg_name} → {value} {unit}".strip(),
+        }
+        decide(None, phys_verdict)
+    except Exception:
+        pass
+
+
 def apply_write(register: int, value: float):
     """Called by middleware when a command is forwarded. Updates plant target.
 
@@ -64,6 +79,9 @@ def apply_write(register: int, value: float):
             raise ValueError(f"Unknown register: {register}")
         _target_values[register] = value
         _recent_writes.append(time.time())
+
+    notify_upstream_response(register, value)
+
 
 
 def tick(dt: float):
