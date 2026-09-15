@@ -1,203 +1,763 @@
-/**
- * INDUSTRIAL MIND — DUAL SIDE-BY-SIDE MONITORING CONTROLLER
- */
+// =========================================================
+// INDUSTRIAL MIND DASHBOARD
+// =========================================================
 
-document.addEventListener("DOMContentLoaded", () => {
-    let cpuChart = null;
+let cpuChart = null;
 
-    // DOM Elements
-    const kpiTotalEl = document.getElementById("kpi-total");
-    const kpiPassEl = document.getElementById("kpi-pass");
-    const kpiDropEl = document.getElementById("kpi-drop");
 
-    const tbodyScadaPlc = document.getElementById("tbody-scada-plc");
-    const tbodyPlcScada = document.getElementById("tbody-plc-scada");
+// =========================================================
+// FETCH DASHBOARD DATA
+// =========================================================
 
-    const valPressure = document.getElementById("val-pressure");
-    const valSpeed = document.getElementById("val-speed");
-    const valValve = document.getElementById("val-valve");
-    const barPressure = document.getElementById("bar-pressure");
-    const barSpeed = document.getElementById("bar-speed");
-    const barValve = document.getElementById("bar-valve");
+async function refreshDashboard() {
 
-    const valCpuLoad = document.getElementById("val-cpu-load");
+    try {
 
-    const btnTriggerAttack = document.getElementById("btn-trigger-attack");
-    const btnResetData = document.getElementById("btn-reset-data");
+        const response = await fetch(
+            "/api/dashboard",
+            {
+                cache: "no-store"
+            }
+        );
 
-    // ==========================================
-    // 1. CHART INITIALIZATION
-    // ==========================================
-    function initCpuChart() {
-        const canvas = document.getElementById("cpuLoadChart");
-        if (!canvas) return;
-        const ctx = canvas.getContext("2d");
+        if (!response.ok) {
+            throw new Error(
+                `HTTP ${response.status}`
+            );
+        }
 
-        cpuChart = new Chart(ctx, {
-            type: "line",
-            data: {
-                labels: [],
-                datasets: [{
-                    label: "CPU Load (%)",
-                    data: [],
-                    borderColor: "#0ea5e9",
-                    borderWidth: 2,
-                    backgroundColor: "rgba(14, 165, 233, 0.08)",
-                    fill: true,
-                    tension: 0.2,
-                    pointRadius: 2,
-                    pointBackgroundColor: "#0ea5e9"
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                animation: { duration: 250 },
-                plugins: {
-                    legend: { display: false }
+        const data = await response.json();
+
+        updateOverview(
+            data.overview || {}
+        );
+
+        updateScadaToPlc(
+            data.scada_to_plc || []
+        );
+
+        updatePlcToScada(
+            data.plc_to_scada || []
+        );
+
+        updateTelemetry(
+            data.telemetry || {}
+        );
+
+        updateCpuChart(
+            data.cpu_history || []
+        );
+
+        updateCpuValue(
+            data.telemetry || {}
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Dashboard update failed:",
+            error
+        );
+    }
+}
+
+
+// =========================================================
+// OVERVIEW
+// =========================================================
+
+function updateOverview(overview) {
+
+    const total =
+        document.getElementById(
+            "kpi-total"
+        );
+
+    const pass =
+        document.getElementById(
+            "kpi-pass"
+        );
+
+    const drop =
+        document.getElementById(
+            "kpi-drop"
+        );
+
+    if (total) {
+
+        total.textContent =
+            overview.total_requests ?? 0;
+    }
+
+    if (pass) {
+
+        pass.textContent =
+            overview.pass ?? 0;
+    }
+
+    if (drop) {
+
+        drop.textContent =
+            overview.drop ?? 0;
+    }
+}
+
+
+// =========================================================
+// SCADA -> PLC TABLE
+// =========================================================
+
+function updateScadaToPlc(events) {
+
+    const tbody =
+        document.getElementById(
+            "tbody-scada-plc"
+        );
+
+    if (!tbody) {
+        return;
+    }
+
+    tbody.innerHTML = "";
+
+    events.forEach(event => {
+
+        const row =
+            document.createElement(
+                "tr"
+            );
+
+        const verdict =
+            String(
+                event.verdict || "UNKNOWN"
+            ).toUpperCase();
+
+        row.innerHTML = `
+            <td>${safe(event.timestamp)}</td>
+
+            <td>
+                <span class="transaction-id">
+                    ${safe(event.tx_id)}
+                </span>
+            </td>
+
+            <td>${safe(event.command)}</td>
+
+            <td>
+                <span class="verdict ${verdictClass(verdict)}">
+                    ${safe(verdict)}
+                </span>
+            </td>
+
+            <td>${safe(event.reason)}</td>
+
+            <td>
+                ${formatLatency(event.latency_ms)}
+            </td>
+        `;
+
+        tbody.appendChild(row);
+    });
+}
+
+
+// =========================================================
+// PLC -> SCADA TABLE
+// =========================================================
+
+function updatePlcToScada(events) {
+
+    const tbody =
+        document.getElementById(
+            "tbody-plc-scada"
+        );
+
+    if (!tbody) {
+        return;
+    }
+
+    tbody.innerHTML = "";
+
+    events.forEach(event => {
+
+        const row =
+            document.createElement(
+                "tr"
+            );
+
+        const verdict =
+            String(
+                event.verdict || "PASS"
+            ).toUpperCase();
+
+        row.innerHTML = `
+            <td>${safe(event.timestamp)}</td>
+
+            <td>
+                <span class="transaction-id">
+                    ${safe(event.tx_id)}
+                </span>
+            </td>
+
+            <td>${safe(event.command)}</td>
+
+            <td>
+                <span class="verdict ${verdictClass(verdict)}">
+                    ${safe(verdict)}
+                </span>
+            </td>
+
+            <td>${safe(event.reason)}</td>
+
+            <td>
+                ${formatLatency(event.latency_ms)}
+            </td>
+        `;
+
+        tbody.appendChild(row);
+    });
+}
+
+
+// =========================================================
+// TELEMETRY
+// =========================================================
+
+function updateTelemetry(telemetry) {
+
+    const registers =
+        telemetry.registers || {};
+
+    // -----------------------------
+    // Tank Pressure
+    // -----------------------------
+
+    const pressure =
+        Number(
+            registers.TANK_PRESSURE ?? 0
+        );
+
+    setText(
+        "val-pressure",
+        `${pressure.toFixed(1)} PSI`
+    );
+
+    setBar(
+        "bar-pressure",
+        pressure,
+        100
+    );
+
+
+    // -----------------------------
+    // Conveyor Speed
+    // -----------------------------
+
+    const speed =
+        Number(
+            registers.CONVEYOR_SPEED ?? 0
+        );
+
+    setText(
+        "val-speed",
+        `${speed.toFixed(1)} RPM`
+    );
+
+    setBar(
+        "bar-speed",
+        speed,
+        120
+    );
+
+
+    // -----------------------------
+    // Cooling Valve
+    // -----------------------------
+
+    const valve =
+        Number(
+            registers.COOLING_VALVE ?? 0
+        );
+
+    setText(
+        "val-valve",
+        `${valve.toFixed(1)}°`
+    );
+
+    setBar(
+        "bar-valve",
+        valve,
+        90
+    );
+}
+
+
+// =========================================================
+// CPU VALUE
+// =========================================================
+
+function updateCpuValue(telemetry) {
+
+    const element =
+        document.getElementById(
+            "val-cpu-load"
+        );
+
+    if (!element) {
+        return;
+    }
+
+    const value =
+        Number(
+            telemetry.cpu_load ?? 0
+        );
+
+    element.textContent =
+        `${value.toFixed(1)}%`;
+}
+
+
+// =========================================================
+// BAR UPDATE
+// =========================================================
+
+function setBar(
+    id,
+    value,
+    maximum
+) {
+
+    const element =
+        document.getElementById(id);
+
+    if (!element) {
+        return;
+    }
+
+    const percentage =
+        Math.max(
+            0,
+            Math.min(
+                100,
+                (value / maximum) * 100
+            )
+        );
+
+    element.style.width =
+        `${percentage}%`;
+}
+
+
+// =========================================================
+// CPU GRAPH
+// =========================================================
+
+function updateCpuChart(history) {
+
+    const canvas =
+        document.getElementById(
+            "cpuLoadChart"
+        );
+
+    if (!canvas) {
+        return;
+    }
+
+    if (typeof Chart === "undefined") {
+
+        console.error(
+            "Chart.js is not loaded."
+        );
+
+        return;
+    }
+
+    const labels =
+        history.map(
+            point => point.time
+        );
+
+    const values =
+        history.map(
+            point =>
+                Number(point.value)
+        );
+
+    if (cpuChart) {
+
+        cpuChart.data.labels =
+            labels;
+
+        cpuChart.data.datasets[0].data =
+            values;
+
+        cpuChart.update(
+            "none"
+        );
+
+        return;
+    }
+
+    const ctx =
+        canvas.getContext(
+            "2d"
+        );
+
+    cpuChart =
+        new Chart(
+            ctx,
+            {
+                type: "line",
+
+                data: {
+
+                    labels: labels,
+
+                    datasets: [
+                        {
+                            label:
+                                "CPU Load (%)",
+
+                            data: values,
+
+                            borderWidth: 2,
+
+                            fill: true,
+
+                            tension: 0.3,
+
+                            pointRadius: 0
+                        }
+                    ]
                 },
-                scales: {
-                    x: {
-                        grid: { color: "rgba(255, 255, 255, 0.05)" },
-                        ticks: { color: "#64748b", font: { family: "JetBrains Mono", size: 10 } }
+
+                options: {
+
+                    responsive: true,
+
+                    maintainAspectRatio:
+                        false,
+
+                    animation: false,
+
+                    scales: {
+
+                        x: {
+                            ticks: {
+                                maxTicksLimit: 8
+                            }
+                        },
+
+                        y: {
+
+                            beginAtZero: true,
+
+                            min: 0,
+
+                            max: 100,
+
+                            ticks: {
+
+                                callback:
+                                    value =>
+                                        `${value}%`
+                            }
+                        }
                     },
-                    y: {
-                        min: 0,
-                        max: 100,
-                        grid: { color: "rgba(255, 255, 255, 0.05)" },
-                        ticks: {
-                            color: "#64748b",
-                            font: { family: "JetBrains Mono", size: 10 },
-                            callback: (v) => `${v}%`
+
+                    plugins: {
+
+                        legend: {
+                            display: false
                         }
                     }
                 }
             }
-        });
+        );
+}
+
+
+// =========================================================
+// HELPERS
+// =========================================================
+
+function setText(
+    id,
+    value
+) {
+
+    const element =
+        document.getElementById(id);
+
+    if (element) {
+
+        element.textContent =
+            value;
+    }
+}
+
+
+function formatLatency(value) {
+
+    const number =
+        Number(value);
+
+    if (
+        Number.isNaN(number)
+    ) {
+
+        return "—";
     }
 
-    initCpuChart();
+    return `${number.toFixed(1)} ms`;
+}
 
-    // Helper to render table rows
-    function renderTableRows(tbody, logItems) {
-        if (!tbody || !logItems) return;
-        tbody.innerHTML = "";
-        logItems.forEach((item) => {
-            const tr = document.createElement("tr");
-            const verdictClass = item.verdict === "PASS" ? "PASS" : "DROP";
-            const reasonClass = item.verdict === "DROP" ? "drop-reason" : "";
 
-            tr.innerHTML = `
-                <td style="color: #64748b; font-family: var(--font-mono);">${item.timestamp}</td>
-                <td class="tx-id">${item.tx_id}</td>
-                <td class="cmd-name">${item.command}</td>
-                <td><span class="badge ${verdictClass}">${item.verdict}</span></td>
-                <td class="reason-text ${reasonClass}">${item.reason}</td>
-                <td class="latency">${item.latency_ms} ms</td>
-            `;
-            tbody.appendChild(tr);
-        });
+function verdictClass(verdict) {
+
+    const value =
+        String(
+            verdict || ""
+        ).toLowerCase();
+
+    if (value === "pass") {
+        return "pass";
     }
 
-    // ==========================================
-    // 2. FETCH DATA & UPDATE UNIFIED DASHBOARD
-    // ==========================================
-    async function updateDashboardData() {
-        try {
-            const response = await fetch("/api/dashboard");
-            if (!response.ok) return;
-            const data = await response.json();
+    if (
+        value === "drop" ||
+        value === "alert" ||
+        value === "blocked"
+    ) {
+        return "drop";
+    }
 
-            // A. Update Overview Cards
-            if (data.overview) {
-                if (kpiTotalEl) kpiTotalEl.textContent = data.overview.total_requests.toLocaleString();
-                if (kpiPassEl) kpiPassEl.textContent = data.overview.pass.toLocaleString();
-                if (kpiDropEl) kpiDropEl.textContent = data.overview.drop.toLocaleString();
-            }
+    return "unknown";
+}
 
-            // B. Update Left Table (SCADA -> PLC)
-            if (data.scada_to_plc && tbodyScadaPlc) {
-                renderTableRows(tbodyScadaPlc, data.scada_to_plc);
-            }
 
-            // C. Update Right Table (PLC -> SCADA)
-            if (data.plc_to_scada && tbodyPlcScada) {
-                renderTableRows(tbodyPlcScada, data.plc_to_scada);
-            }
+function safe(value) {
 
-            // D. Update Telemetry
-            if (data.telemetry && data.telemetry.registers) {
-                const reg = data.telemetry.registers;
-                if (valPressure) valPressure.textContent = `${reg.TANK_PRESSURE.toFixed(0)} PSI`;
-                if (barPressure) barPressure.style.width = `${Math.min(100, Math.max(0, reg.TANK_PRESSURE))}%`;
+    if (
+        value === undefined ||
+        value === null ||
+        value === ""
+    ) {
 
-                if (valSpeed) valSpeed.textContent = `${reg.CONVEYOR_SPEED.toFixed(0)} RPM`;
-                if (barSpeed) barSpeed.style.width = `${Math.min(100, Math.max(0, (reg.CONVEYOR_SPEED / 120) * 100))}%`;
+        return "—";
+    }
 
-                if (valValve) valValve.textContent = `${reg.COOLING_VALVE.toFixed(0)}°`;
-                if (barValve) barValve.style.width = `${Math.min(100, Math.max(0, (reg.COOLING_VALVE / 90) * 100))}%`;
-            }
+    return String(value)
+        .replaceAll(
+            "&",
+            "&amp;"
+        )
+        .replaceAll(
+            "<",
+            "&lt;"
+        )
+        .replaceAll(
+            ">",
+            "&gt;"
+        )
+        .replaceAll(
+            '"',
+            "&quot;"
+        )
+        .replaceAll(
+            "'",
+            "&#039;"
+        );
+}
 
-            // E. Update CPU Load Chart
-            if (cpuChart && data.cpu_history && data.telemetry) {
-                const currentCpu = data.telemetry.cpu_load;
-                if (valCpuLoad) valCpuLoad.textContent = `${currentCpu.toFixed(0)}%`;
 
-                const labels = data.cpu_history.map(h => h.time);
-                const points = data.cpu_history.map(h => h.cpu_load);
+// =========================================================
+// ATTACK PANEL
+// =========================================================
 
-                cpuChart.data.labels = labels;
-                cpuChart.data.datasets[0].data = points;
+function toggleAttackPanel() {
 
-                if (currentCpu > 60) {
-                    cpuChart.data.datasets[0].borderColor = "#f43f5e";
-                    cpuChart.data.datasets[0].pointBackgroundColor = "#f43f5e";
-                } else {
-                    cpuChart.data.datasets[0].borderColor = "#0ea5e9";
-                    cpuChart.data.datasets[0].pointBackgroundColor = "#0ea5e9";
+    const panel =
+        document.getElementById(
+            "attack-panel"
+        );
+
+    if (!panel) {
+        return;
+    }
+
+    if (
+        panel.style.display === "none" ||
+        panel.style.display === ""
+    ) {
+
+        panel.style.display =
+            "block";
+
+    } else {
+
+        panel.style.display =
+            "none";
+    }
+}
+
+
+// =========================================================
+// TRIGGER ATTACK
+// =========================================================
+
+async function triggerAttack(attack) {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/trigger-attack",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body: JSON.stringify({
+                        attack: attack
+                    })
                 }
-                cpuChart.update();
-            }
+            );
 
-        } catch (err) {
-            console.error("[Dashboard Fetch Error]", err);
+        const result =
+            await response.json();
+
+        console.log(
+            "Attack:",
+            result
+        );
+
+        if (!result.success) {
+
+            console.error(
+                "Attack rejected:",
+                result.error
+            );
+
+            return;
         }
+
+        console.log(
+            `[DASHBOARD] ${attack} launched`
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Attack failed:",
+            error
+        );
+    }
+}
+
+
+// =========================================================
+// RESET
+// =========================================================
+
+async function resetDashboard() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/reset",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    }
+                }
+            );
+
+        const result =
+            await response.json();
+
+        if (!result.success) {
+
+            console.error(
+                "Reset failed:",
+                result.error
+            );
+
+            return;
+        }
+
+        console.log(
+            "[DASHBOARD] Reset successful"
+        );
+
+        await refreshDashboard();
+
+    } catch (error) {
+
+        console.error(
+            "Reset failed:",
+            error
+        );
+    }
+}
+
+
+// =========================================================
+// BUTTON EVENTS
+// =========================================================
+
+function setupButtons() {
+
+    const attackButton =
+        document.getElementById(
+            "btn-trigger-attack"
+        );
+
+    const resetButton =
+        document.getElementById(
+            "btn-reset-data"
+        );
+
+    if (attackButton) {
+
+        attackButton.addEventListener(
+            "click",
+            toggleAttackPanel
+        );
     }
 
-    // ==========================================
-    // 3. ACTION BUTTONS
-    // ==========================================
-    if (btnTriggerAttack) {
-        btnTriggerAttack.addEventListener("click", async () => {
-            try {
-                btnTriggerAttack.disabled = true;
-                btnTriggerAttack.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Injecting...`;
-                await fetch("/api/trigger-attack", { method: "POST" });
-                await updateDashboardData();
-            } catch (err) {
-                console.error("[Attack Error]", err);
-            } finally {
-                setTimeout(() => {
-                    btnTriggerAttack.disabled = false;
-                    btnTriggerAttack.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> Inject Attack`;
-                }, 800);
-            }
-        });
-    }
+    if (resetButton) {
 
-    if (btnResetData) {
-        btnResetData.addEventListener("click", async () => {
-            if (!confirm("Reset telemetry & metrics baseline?")) return;
-            try {
-                await fetch("/api/reset", { method: "POST" });
-                await updateDashboardData();
-            } catch (err) {
-                console.error("[Reset Error]", err);
-            }
-        });
+        resetButton.addEventListener(
+            "click",
+            resetDashboard
+        );
     }
+}
 
-    // Initial load & 2-second update loop
-    updateDashboardData();
-    setInterval(updateDashboardData, 2000);
-});
+
+// =========================================================
+// START
+// =========================================================
+
+document.addEventListener(
+    "DOMContentLoaded",
+    () => {
+
+        setupButtons();
+
+        refreshDashboard();
+
+        setInterval(
+            refreshDashboard,
+            1000
+        );
+    }
+);

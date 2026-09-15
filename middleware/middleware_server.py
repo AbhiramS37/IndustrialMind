@@ -1,45 +1,35 @@
 """
-middleware/middleware_server.py — the proxy between SCADA and the PLC.
+middleware/middleware_server.py — proxy between SCADA and PLC.
 
 Architecture:
-  - Modbus TCP SERVER on port 5021, facing SCADA (or an attacker).
-  - Modbus TCP CLIENT to the PLC on port 5020, forwarding approved writes
-    and polling telemetry.
 
-Downstream (SCADA -> PLC):
-  1. A write lands on the middleware's own datastore.
-  2. Build a command dict, run cyber_agent.check() + physical_agent.check_command().
-  3. orchestrator.decide() fuses the two verdicts into a logged PASS/DROP.
-  4. PASS  -> forward the write to the real PLC.
-     DROP  -> absorb it here. The write is never forwarded, so it has no
-              physical effect — but the Modbus transaction itself still
-              completes normally against the middleware's own datastore.
-              (A real MITM attacker's write looks "successful" to them right
-              up until they check whether the plant actually moved.)
+SCADA
+  |
+  v
+Middleware :5021
+  |
+  |-- DROP --> STOP (never reaches PLC)
+  |
+  |-- PASS --> PLC :5020
+                 |
+                 v
+             PLC feedback
+                 |
+                 v
+              Middleware
+                 |
+                 v
+               SCADA
 
-Upstream (PLC -> SCADA):
-  A background poller reads the PLC's real telemetry every POLL_INTERVAL
-  seconds, keeps the SCADA-facing datastore in sync with ground truth, and
-  runs physical_agent.check_feedback() against any register with a pending
-  commanded value — logging the result via orchestrator with cyber_verdict=None.
-
-Known simplification (read before demoing):
-  pymodbus's synchronous datastore hook (the one this file and plc.py both
-  use, on the pre-3.13 API) does not expose the TCP peer address to
-  setValues(). Every incoming write is tagged with DEFAULT_SOURCE_IP below,
-  regardless of whether it came from scada.py or attacker.py. Practically
-  this means cyber_agent's rate-limit, replay, and function-code checks
-  still work correctly (they judge *behavior*, not *identity*), but the
-  UNTRUSTED_SOURCE check can never fire in this build, since every
-  connection is labeled as the whitelisted IP. If Gauri's attacker.py needs
-  to demo that specific check, the cleanest fix is a second listening port
-  dedicated to attacker traffic, tagged with a non-whitelisted IP — flag
-  this with the team before demo day if it matters for the metrics slide.
+Dashboard:
+  LEFT  = every SCADA -> PLC security decision
+  RIGHT = only actual PLC confirmations for PASSed commands
 """
 
 import time
 import threading
 import uuid
+import requests
 
 from pymodbus.client import ModbusTcpClient
 from pymodbus.datastore import (
@@ -56,68 +46,147 @@ from docs.interfaces import (
     CONVEYOR_SPEED,
     COOLING_VALVE,
 )
-from middleware import cyber_agent, physical_agent, orchestrator
 
-# ── Config ───────────────────────────────────────────────────────────────
+from middleware import (
+    cyber_agent,
+    physical_agent,
+    orchestrator,
+)
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
 PLC_HOST = "127.0.0.1"
 PLC_PORT = 5020
+
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 5021
-SCALE = 10  # must match plc.py's _SCALE
-POLL_INTERVAL = 0.2  # seconds between telemetry polls / feedback checks
-DEFAULT_SOURCE_IP = "192.168.1.10"  # see "Known simplification" above
-FEEDBACK_SETTLED_TOLERANCE = 0.05  # stop tracking a pending command once the PLC is this close to it
 
-_ALL_REGISTERS = (TANK_PRESSURE, CONVEYOR_SPEED, COOLING_VALVE)
+DASHBOARD_URL = "http://127.0.0.1:5050"
 
-# ── Shared state (protected by _state_lock) ─────────────────────────────
+SCALE = 10
+
+# PLC is checked frequently for real feedback.
+POLL_INTERVAL = 0.2
+
+# Dashboard telemetry does not need to be sent every
+# PLC polling cycle.
+TELEMETRY_REPORT_INTERVAL = 1.0
+
+DEFAULT_SOURCE_IP = "192.168.1.10"
+
+FEEDBACK_SETTLED_TOLERANCE = 0.05
+
+
+_ALL_REGISTERS = (
+    TANK_PRESSURE,
+    CONVEYOR_SPEED,
+    COOLING_VALVE,
+)
+
+
+# =========================================================
+# SHARED STATE
+# =========================================================
+
 _state_lock = threading.Lock()
+
 _plc_state = {
-    "registers": {TANK_PRESSURE: 50.0, CONVEYOR_SPEED: 0.0, COOLING_VALVE: 45.0},
+    "registers": {
+        TANK_PRESSURE: 50.0,
+        CONVEYOR_SPEED: 0.0,
+        COOLING_VALVE: 45.0,
+    },
     "timestamp": time.time(),
 }
-_pending_commands = {}  # register -> {"tx_id": str, "value": float, "time": float}
-_register_settled_since = {reg: time.time() - 3.0 for reg in _ALL_REGISTERS}
-# ^ per-register "how long has this been sitting still" clock, initialized a few
-# seconds in the past so the very first legitimate command after middleware
-# startup isn't unfairly rate-limited by an artificially tiny window (see
-# scada.py's operator profile — first writes land within ~1.5-3s of startup).
-# Deliberately NOT a large grace period: too generous here would let an
-# obviously-impossible instant jump slip through disguised as "gradual" (tested
-# and caught during integration — see pipeline_test.py test 3). 3 seconds covers
-# a realistic single operator step without hiding a genuine rate violation.
-# Updated only when a pending command's target is reached — NOT on every poll —
-# so a rate check run shortly after a poll cycle doesn't see a near-zero window
-# either. See _handle_downstream_write() and _poll_once() for where this is read/reset.
+
+
+# Only PASSed commands that were actually forwarded
+# to the PLC are stored here.
+_pending_commands = {}
+
+
+_register_settled_since = {
+    reg: time.time() - 3.0
+    for reg in _ALL_REGISTERS
+}
+
 
 _plc_client: ModbusTcpClient | None = None
 
+_last_telemetry_report = 0.0
+
+
+# =========================================================
+# RAW / REAL VALUE CONVERSION
+# =========================================================
 
 def _to_raw(value: float) -> int:
-    return max(0, min(65535, int(round(value * SCALE))))
+    return max(
+        0,
+        min(
+            65535,
+            int(round(value * SCALE))
+        )
+    )
 
 
 def _from_raw(raw: int) -> float:
     return raw / SCALE
 
 
+# =========================================================
+# MODBUS DATA BLOCK
+# =========================================================
+
 class MiddlewareDataBlock(ModbusSequentialDataBlock):
-    """SCADA-facing holding registers. A write here runs the full
-    cyber + physical + orchestrator pipeline before it's (maybe) forwarded
-    to the real PLC. The write is always accepted locally — see module
-    docstring for why DROP doesn't mean "reject the Modbus transaction"."""
+    """
+    SCADA-facing holding registers.
+
+    External writes enter here and are processed by
+    the security pipeline.
+    """
 
     def setValues(self, address, values):
+
+        # Store the value locally first.
         super().setValues(address, values)
+
+        # Process every affected register.
         for i, raw_value in enumerate(values):
+
             register = address + i
+
             if register in _ALL_REGISTERS:
-                _handle_downstream_write(register, _from_raw(raw_value))
+
+                value = _from_raw(raw_value)
+
+                _handle_downstream_write(
+                    register,
+                    value
+                )
 
 
-def _handle_downstream_write(register: int, value: float):
+# =========================================================
+# SCADA -> PLC
+# =========================================================
+
+def _handle_downstream_write(
+    register: int,
+    value: float
+):
+
     start_time = time.time()
+
     tx_id = str(uuid.uuid4())
+
+    register_name = REGISTER_MAP[register]["name"]
+
+    # -----------------------------------------------------
+    # Build command
+    # -----------------------------------------------------
 
     command = make_command(
         tx_id=tx_id,
@@ -128,92 +197,481 @@ def _handle_downstream_write(register: int, value: float):
         value=value,
     )
 
-    cyber_verdict = cyber_agent.check(command)
+    # -----------------------------------------------------
+    # Cyber Agent
+    # -----------------------------------------------------
+
+    cyber_verdict = cyber_agent.check(
+        command
+    )
+
+    # -----------------------------------------------------
+    # Current PLC state
+    # -----------------------------------------------------
 
     with _state_lock:
+
         current_state = {
-            "registers": dict(_plc_state["registers"]),
-            "timestamp": _register_settled_since[register],
+            "registers": dict(
+                _plc_state["registers"]
+            ),
+
+            "timestamp": _register_settled_since[
+                register
+            ],
         }
-    physical_verdict = physical_agent.check_command(command, current_state)
 
-    decision = orchestrator.decide(cyber_verdict, physical_verdict, start_time)
-    name = REGISTER_MAP[register]["name"]
-    print(f"[MIDDLEWARE] {decision['verdict']:4s} {name}={value:.2f} reason={decision['reason']}")
+    # -----------------------------------------------------
+    # Physical Agent
+    # -----------------------------------------------------
 
-    if decision["verdict"] == "PASS":
-        _forward_to_plc(register, value)
+    physical_verdict = physical_agent.check_command(
+        command,
+        current_state
+    )
+
+    # Human-readable command for dashboard.
+    physical_verdict["command"] = (
+        f"{register_name} → {value:.2f}"
+    )
+
+    # -----------------------------------------------------
+    # Orchestrator
+    # -----------------------------------------------------
+
+    decision = orchestrator.decide(
+        cyber_verdict,
+        physical_verdict,
+        start_time
+    )
+
+    # -----------------------------------------------------
+    # Terminal output
+    # -----------------------------------------------------
+
+    print(
+        f"[MIDDLEWARE] "
+        f"{decision['verdict']:4s} "
+        f"{register_name}={value:.2f} "
+        f"reason={decision['reason']}"
+    )
+
+    # -----------------------------------------------------
+    # DROP
+    #
+    # Nothing is added to _pending_commands.
+    # Therefore there will be NO PLC response.
+    # -----------------------------------------------------
+
+    if decision["verdict"] == "DROP":
+
+        return
+
+    # -----------------------------------------------------
+    # PASS
+    #
+    # Register the pending command BEFORE forwarding.
+    # -----------------------------------------------------
+
+    with _state_lock:
+
+        _pending_commands[register] = {
+            "tx_id": tx_id,
+            "value": value,
+            "time": start_time,
+        }
+
+    # -----------------------------------------------------
+    # Forward approved command to REAL PLC
+    # -----------------------------------------------------
+
+    success = _forward_to_plc(
+        register,
+        value
+    )
+
+    # If forwarding failed, remove pending command.
+    if not success:
+
         with _state_lock:
-            _pending_commands[register] = {"tx_id": tx_id, "value": value, "time": start_time}
-    # DROP: intentionally do nothing further. The command is absorbed here.
+
+            _pending_commands.pop(
+                register,
+                None
+            )
 
 
-def _forward_to_plc(register: int, value: float):
+# =========================================================
+# FORWARD WRITE TO REAL PLC
+# =========================================================
+
+def _forward_to_plc(
+    register: int,
+    value: float
+) -> bool:
+
     if _plc_client is None:
-        print("[MIDDLEWARE] WARNING: no PLC connection — write not forwarded")
-        return
+
+        print(
+            "[MIDDLEWARE] WARNING: "
+            "no PLC connection — write not forwarded"
+        )
+
+        return False
+
     try:
-        _plc_client.write_register(register, _to_raw(value))
+
+        result = _plc_client.write_register(
+            register,
+            _to_raw(value)
+        )
+
+        if result.isError():
+
+            print(
+                f"[MIDDLEWARE] "
+                f"PLC rejected write "
+                f"register={register} "
+                f"value={value:.2f}"
+            )
+
+            return False
+
+        print(
+            f"[MIDDLEWARE] "
+            f"FORWARDED TO PLC "
+            f"register={register} "
+            f"value={value:.2f}"
+        )
+
+        return True
+
     except Exception as e:
-        print(f"[MIDDLEWARE] ERROR forwarding to PLC: {e}")
+
+        print(
+            f"[MIDDLEWARE] "
+            f"ERROR forwarding to PLC: {e}"
+        )
+
+        return False
 
 
-def _internal_sync_write(block: ModbusSequentialDataBlock, address: int, values: list):
-    """Writes to the SCADA-facing datastore WITHOUT re-triggering
-    MiddlewareDataBlock.setValues — same pattern as plc.py's internal sync,
-    for the same reason: this is us pushing real PLC state into the
-    datastore for reads, not a new command to evaluate."""
-    ModbusSequentialDataBlock.setValues(block, address, values)
+# =========================================================
+# INTERNAL DATA SYNC
+# =========================================================
+
+def _internal_sync_write(
+    block: ModbusSequentialDataBlock,
+    address: int,
+    values: list
+):
+
+    """
+    Writes real PLC telemetry into the SCADA-facing
+    datastore WITHOUT triggering the downstream
+    command pipeline again.
+    """
+
+    ModbusSequentialDataBlock.setValues(
+        block,
+        address,
+        values
+    )
 
 
-def _poll_once(block: "MiddlewareDataBlock"):
-    """Runs one poll cycle: read real PLC state, sync it into the SCADA-facing
-    datastore, and check upstream feedback for any pending command.
-    Factored out so start_middleware_server() can call this once, synchronously,
-    before opening for business, so the SCADA-facing datastore reflects real
-    PLC values from the first read rather than all-zeros."""
+# =========================================================
+# DASHBOARD — PLC -> SCADA RESPONSE
+# =========================================================
+
+def _report_plc_response(
+    tx_id: str,
+    register: int,
+    value: float,
+    latency_ms: float
+):
+
+    """
+    Report an ACTUAL PLC confirmation.
+
+    This is called ONLY when:
+
+      1. The original command was PASSed.
+      2. It was forwarded to the real PLC.
+      3. PLC feedback confirms the requested value.
+
+    DROPped commands never reach this function.
+    """
+
+    register_name = REGISTER_MAP[register]["name"]
+
+    payload = {
+        "tx_id": tx_id,
+        "direction": "plc_to_scada",
+        "verdict": "PASS",
+        "reason": "PLC confirmed the requested value.",
+        "command": f"{register_name} → {value:.2f}",
+        "latency_ms": round(latency_ms, 2),
+        "timestamp": time.time(),
+    }
+
+    try:
+
+        response = requests.post(
+            f"{DASHBOARD_URL}/api/security-event",
+            json=payload,
+            timeout=1
+        )
+
+        if response.ok:
+
+            print(
+                f"[MIDDLEWARE] "
+                f"PLC RESPONSE "
+                f"tx={tx_id} "
+                f"{register_name}={value:.2f}"
+            )
+
+        else:
+
+            print(
+                f"[MIDDLEWARE] "
+                f"Dashboard rejected PLC response: "
+                f"{response.status_code}"
+            )
+
+    except Exception as e:
+
+        print(
+            f"[MIDDLEWARE] "
+            f"Could not report PLC response: {e}"
+        )
+
+
+# =========================================================
+# DASHBOARD — REAL PLC TELEMETRY
+# =========================================================
+
+def _report_telemetry():
+
+    """
+    Send actual PLC telemetry to dashboard.
+    """
+
+    with _state_lock:
+
+        registers = {
+            REGISTER_MAP[reg]["name"]:
+            _plc_state["registers"][reg]
+            for reg in _ALL_REGISTERS
+        }
+
+    payload = {
+        "registers": registers
+    }
+
+    try:
+
+        requests.post(
+            f"{DASHBOARD_URL}/api/telemetry",
+            json=payload,
+            timeout=1
+        )
+
+    except Exception:
+        pass
+
+
+# =========================================================
+# PLC POLLING
+# =========================================================
+
+def _poll_once(
+    block: "MiddlewareDataBlock"
+):
+
+    global _last_telemetry_report
+
+    """
+    One polling cycle:
+
+    1. Read actual PLC telemetry.
+    2. Update middleware state.
+    3. Synchronize SCADA-facing registers.
+    4. Check PASSed pending commands.
+    5. Create PLC -> SCADA response only after
+       actual PLC confirmation.
+    """
+
     if _plc_client is None:
         return
+
     try:
-        result = _plc_client.read_holding_registers(0, count=3)
-        if not result.isError():
-            raws = result.registers
-            now = time.time()
+
+        # -------------------------------------------------
+        # Read REAL PLC
+        # -------------------------------------------------
+
+        if not _plc_client.is_socket_open():
+
+            _plc_client.connect()
+
+        result = _plc_client.read_holding_registers(
+            0,
+            count=3
+        )
+
+        if result.isError():
+            return
+
+        raws = result.registers
+
+        now = time.time()
+
+        # -------------------------------------------------
+        # Update middleware's copy of REAL PLC state
+        # -------------------------------------------------
+
+        with _state_lock:
+
+            for reg, raw in zip(
+                _ALL_REGISTERS,
+                raws
+            ):
+
+                _plc_state["registers"][reg] = (
+                    _from_raw(raw)
+                )
+
+            _plc_state["timestamp"] = now
+
+            # -------------------------------------------------
+            # Mirror REAL PLC state into SCADA datastore
+            # -------------------------------------------------
+
+            for reg, raw in zip(
+                _ALL_REGISTERS,
+                raws
+            ):
+
+                _internal_sync_write(
+                    block,
+                    reg,
+                    [raw]
+                )
+
+        # -------------------------------------------------
+        # Dashboard telemetry: once per second
+        #
+        # PLC polling remains every 0.2 seconds.
+        # -------------------------------------------------
+
+        if (
+            now - _last_telemetry_report
+            >= TELEMETRY_REPORT_INTERVAL
+        ):
+
+            _report_telemetry()
+
+            _last_telemetry_report = now
+
+        # -------------------------------------------------
+        # Check ONLY commands that were PASSed
+        # -------------------------------------------------
+
+        for reg in list(_pending_commands.keys()):
+
             with _state_lock:
-                for reg, raw in zip(_ALL_REGISTERS, raws):
-                    _plc_state["registers"][reg] = _from_raw(raw)
-                _plc_state["timestamp"] = now
 
-                for reg, raw in zip(_ALL_REGISTERS, raws):
-                    _internal_sync_write(block, reg, [raw])
+                pending = _pending_commands.get(reg)
 
-                for reg in list(_pending_commands.keys()):
-                    pending = _pending_commands[reg]
-                    reported = _plc_state["registers"][reg]
-                    fb_verdict = physical_agent.check_feedback(
-                        pending["value"], reported, reg
-                    )
-                    fb_verdict["tx_id"] = pending["tx_id"]  # the documented fill-in step
-                    fb_decision = orchestrator.decide(None, fb_verdict, pending["time"])
-                    if fb_decision["verdict"] == "DROP":
-                        print(
-                            f"[MIDDLEWARE] UPSTREAM DROP "
-                            f"{REGISTER_MAP[reg]['name']} reason={fb_decision['reason']}"
-                        )
-                    if abs(reported - pending["value"]) < FEEDBACK_SETTLED_TOLERANCE:
-                        del _pending_commands[reg]
-                        _register_settled_since[reg] = now  # just reached target -> clock resets here
+                if pending is None:
+                    continue
+
+                reported = (
+                    _plc_state["registers"][reg]
+                )
+
+            # -------------------------------------------------
+            # Check actual PLC value
+            # -------------------------------------------------
+
+            feedback_ok = (
+                abs(
+                    reported -
+                    pending["value"]
+                )
+                < FEEDBACK_SETTLED_TOLERANCE
+            )
+
+            # -------------------------------------------------
+            # PLC has NOT confirmed yet.
+            #
+            # No right-side event.
+            # -------------------------------------------------
+
+            if not feedback_ok:
+
+                continue
+
+            # -------------------------------------------------
+            # PLC HAS confirmed the command.
+            #
+            # Now create the PLC -> SCADA response.
+            # -------------------------------------------------
+
+            latency_ms = (
+                now - pending["time"]
+            ) * 1000
+
+            _report_plc_response(
+                tx_id=pending["tx_id"],
+                register=reg,
+                value=pending["value"],
+                latency_ms=latency_ms
+            )
+
+            # -------------------------------------------------
+            # Remove pending command so the same response
+            # is not reported repeatedly.
+            # -------------------------------------------------
+
+            with _state_lock:
+
+                _pending_commands.pop(
+                    reg,
+                    None
+                )
+
+                _register_settled_since[reg] = now
+
     except Exception as e:
-        print(f"[MIDDLEWARE] ERROR polling PLC: {e}")
+
+        print(
+            f"[MIDDLEWARE] "
+            f"ERROR polling PLC: {e}"
+        )
 
 
-def _poll_plc_loop(block: "MiddlewareDataBlock"):
-    """Reads real PLC state, mirrors it into the SCADA-facing datastore,
-    and runs the upstream feedback check against any pending command."""
+# =========================================================
+# POLLING LOOP
+# =========================================================
+
+def _poll_plc_loop(
+    block: "MiddlewareDataBlock"
+):
+
     while True:
-        _poll_once(block)
-        time.sleep(POLL_INTERVAL)
 
+        _poll_once(block)
+
+        time.sleep(
+            POLL_INTERVAL
+        )
+
+
+# =========================================================
+# START MIDDLEWARE
+# =========================================================
 
 def start_middleware_server(
     listen_host: str = LISTEN_HOST,
@@ -221,28 +679,87 @@ def start_middleware_server(
     plc_host: str = PLC_HOST,
     plc_port: int = PLC_PORT,
 ):
+
     global _plc_client
-    _plc_client = ModbusTcpClient(host=plc_host, port=plc_port)
+
+    # -----------------------------------------------------
+    # Connect to PLC
+    # -----------------------------------------------------
+
+    _plc_client = ModbusTcpClient(
+        host=plc_host,
+        port=plc_port
+    )
+
     if not _plc_client.connect():
+
         print(
-            f"[MIDDLEWARE] WARNING: could not connect to PLC at {plc_host}:{plc_port} "
-            "yet — will keep retrying on each poll"
+            f"[MIDDLEWARE] WARNING: "
+            f"could not connect to PLC at "
+            f"{plc_host}:{plc_port} yet — "
+            f"will keep retrying"
         )
 
-    block = MiddlewareDataBlock(0, [0] * 3)
-    store = ModbusSlaveContext(hr=block, zero_mode=True)
-    context = ModbusServerContext(slaves=store, single=True)
+    # -----------------------------------------------------
+    # Create SCADA-facing datastore
+    # -----------------------------------------------------
 
-    _poll_once(block)  # warm up _plc_state before accepting any writes — see _poll_once docstring
-    threading.Thread(target=_poll_plc_loop, args=(block,), daemon=True).start()
+    block = MiddlewareDataBlock(
+        0,
+        [0] * 3
+    )
+
+    store = ModbusSlaveContext(
+        hr=block,
+        zero_mode=True
+    )
+
+    context = ModbusServerContext(
+        slaves=store,
+        single=True
+    )
+
+    # -----------------------------------------------------
+    # Initial PLC synchronization
+    # -----------------------------------------------------
+
+    _poll_once(block)
+
+    # -----------------------------------------------------
+    # Start background polling
+    # -----------------------------------------------------
+
+    threading.Thread(
+        target=_poll_plc_loop,
+        args=(block,),
+        daemon=True
+    ).start()
+
+    # -----------------------------------------------------
+    # Start Modbus server
+    # -----------------------------------------------------
 
     print(
-        f"[MIDDLEWARE] Listening for SCADA on {listen_host}:{listen_port}, "
-        f"forwarding approved writes to PLC at {plc_host}:{plc_port}"
+        f"[MIDDLEWARE] "
+        f"Listening for SCADA on "
+        f"{listen_host}:{listen_port}, "
+        f"forwarding approved writes to PLC at "
+        f"{plc_host}:{plc_port}"
     )
-    StartTcpServer(context=context, address=(listen_host, listen_port))
 
+    StartTcpServer(
+        context=context,
+        address=(
+            listen_host,
+            listen_port
+        )
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
-    start_middleware_server()
 
+    start_middleware_server()
