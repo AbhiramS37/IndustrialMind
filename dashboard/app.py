@@ -1,349 +1,652 @@
+"""
+dashboard/app.py
+
+Industrial Mind - Real SCADA / PLC Security Dashboard.
+
+SCADA -> PLC:
+    Security decisions made by middleware.
+
+PLC -> SCADA:
+    Only actual PLC confirmations.
+
+No simulated security events.
+"""
+
+import ipaddress
 import os
-import random
+import sys
+import subprocess
+import threading
 import time
-import uuid
-from datetime import datetime
-from threading import Lock, Thread
+from collections import deque
+
 from flask import Flask, jsonify, render_template, request
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(
+        os.path.abspath(__file__)
+    )
+)
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from docs.interfaces import MACHINES  # noqa: E402
+from docs import attack_log  # noqa: E402
 
 app = Flask(__name__)
 
-# ==========================================
-# THREAD-SAFE STATE STORE & MOCK SIMULATOR
-# ==========================================
-state_lock = Lock()
+MAX_EVENTS = 100
 
-dashboard_state = {
-    "scada_to_plc": {
-        "total_requests": 412,
-        "pass_count": 365,
-        "drop_count": 47,
-        "decision_log": []
-    },
-    "plc_to_scada": {
-        "total_requests": 412,
-        "pass_count": 365,
-        "drop_count": 47,
-        "decision_log": []
-    },
-    "telemetry": {
-        "registers": {
-            "TANK_PRESSURE": 65.0,   # PSI (0 - 100)
-            "CONVEYOR_SPEED": 80.0,  # RPM (0 - 120)
-            "COOLING_VALVE": 45.0,   # Degrees (0 - 90)
-        },
-        "cpu_load": 32.0,            # Percentage (0 - 100)
-        "timestamp": int(time.time())
-    },
-    "cpu_history": [],
+_lock = threading.Lock()
+
+_scada_to_plc = deque(maxlen=MAX_EVENTS)
+_plc_to_scada = deque(maxlen=MAX_EVENTS)
+
+_cpu_history = deque(maxlen=60)
+
+_metrics = {
+    "total": 0,
+    "pass": 0,
+    "drop": 0,
 }
 
-# Realistically Paired SCADA Commands & PLC Responses
-PASS_COMMAND_PAIRS = [
-    {
-        "scada_cmd": "Set Motor Speed → 50 RPM",
-        "scada_reason": "SCADA requested the conveyor motor speed to be changed to 50 RPM.",
-        "plc_cmd": "Motor Speed → 50 RPM",
-        "plc_reason": "PLC confirmed that the conveyor motor speed was successfully changed to 50 RPM.",
-        "speed": 50.0
-    },
-    {
-        "scada_cmd": "Set Motor Speed → 80 RPM",
-        "scada_reason": "SCADA requested the conveyor motor speed to be changed to 80 RPM.",
-        "plc_cmd": "Motor Speed → 80 RPM",
-        "plc_reason": "PLC confirmed that the conveyor motor speed was successfully changed to 80 RPM.",
-        "speed": 80.0
-    },
-    {
-        "scada_cmd": "Open Cooling Valve",
-        "scada_reason": "SCADA requested the cooling valve to open.",
-        "plc_cmd": "Cooling Valve → OPEN",
-        "plc_reason": "PLC confirmed that the cooling valve was opened successfully.",
-        "valve": 60.0
-    },
-    {
-        "scada_cmd": "Close Cooling Valve",
-        "scada_reason": "SCADA requested the cooling valve to close.",
-        "plc_cmd": "Cooling Valve → CLOSED",
-        "plc_reason": "PLC confirmed that the cooling valve was closed successfully.",
-        "valve": 15.0
-    },
-    {
-        "scada_cmd": "Start Motor",
-        "scada_reason": "SCADA requested the conveyor motor to start.",
-        "plc_cmd": "Conveyor → RUNNING",
-        "plc_reason": "PLC reported that the conveyor motor started successfully."
-    },
-    {
-        "scada_cmd": "Stop Motor",
-        "scada_reason": "SCADA requested the conveyor motor to stop.",
-        "plc_cmd": "Conveyor → STOPPED",
-        "plc_reason": "PLC confirmed that the conveyor motor stopped successfully."
-    },
-    {
-        "scada_cmd": "Set Tank Pressure → 65 PSI",
-        "scada_reason": "SCADA requested tank pressure to be set to baseline of 65 PSI.",
-        "plc_cmd": "Tank Pressure → 65 PSI",
-        "plc_reason": "PLC confirmed that the tank pressure was updated to 65 PSI.",
-        "pressure": 65.0
-    },
-    {
-        "scada_cmd": "Set Tank Pressure → 85 PSI",
-        "scada_reason": "SCADA requested tank pressure to be adjusted to 85 PSI.",
-        "plc_cmd": "Tank Pressure → 85 PSI",
-        "plc_reason": "PLC reported tank pressure updated to 85 PSI.",
-        "pressure": 85.0
+# One entry per configured machine (docs/interfaces.MACHINES).
+_telemetry = {
+    m["name"]: float(m["initial"]) for m in MACHINES
+}
+
+# Reads logs/blocked_attacks.jsonl written by the middleware.
+_attack_log_reader = attack_log.AttackLogReader()
+
+
+# =========================================================
+# TRANSACTION ID MAPPING
+# =========================================================
+
+_event_counter = 0
+_tx_id_map = {}
+
+
+def _short_tx_id(tx_id):
+    """
+    Convert long UUID into a short dashboard ID.
+
+    The same original transaction ID ALWAYS gets
+    the same short ID.
+
+    Example:
+
+        long UUID -> TX-001
+        same UUID -> TX-001
+    """
+
+    global _event_counter
+
+    if not tx_id or tx_id == "-":
+        _event_counter += 1
+        return f"TX-{_event_counter:03d}"
+
+    tx_id = str(tx_id)
+
+    if tx_id.startswith("TX-"):
+        return tx_id
+
+    if tx_id in _tx_id_map:
+        return _tx_id_map[tx_id]
+
+    _event_counter += 1
+
+    short_id = f"TX-{_event_counter:03d}"
+
+    _tx_id_map[tx_id] = short_id
+
+    return short_id
+
+
+# =========================================================
+# TIME
+# =========================================================
+
+def _format_time(timestamp=None):
+
+    try:
+
+        if timestamp is None:
+            timestamp = time.time()
+
+        timestamp = float(timestamp)
+
+        return time.strftime(
+            "%H:%M:%S",
+            time.localtime(timestamp)
+        )
+
+    except Exception:
+
+        return time.strftime(
+            "%H:%M:%S"
+        )
+
+
+# =========================================================
+# SCADA -> PLC EVENT
+# =========================================================
+
+def add_scada_event(event):
+
+    verdict = str(
+        event.get(
+            "verdict",
+            "UNKNOWN"
+        )
+    ).upper()
+
+    event = {
+        "tx_id": _short_tx_id(
+            event.get("tx_id")
+        ),
+
+        "command": event.get(
+            "command",
+            "-"
+        ),
+
+        "verdict": verdict,
+
+        "reason": event.get(
+            "reason",
+            "-"
+        ),
+
+        "latency_ms": event.get(
+            "latency_ms",
+            0
+        ),
+
+        "timestamp": _format_time(
+            event.get("timestamp")
+        ),
     }
-]
 
-DROP_COMMAND_PAIRS = [
-    {
-        "scada_cmd": "Set Motor Speed → 120 RPM",
-        "scada_reason": "Requested speed exceeds the configured safe limit of 100 RPM.",
-        "plc_cmd": "Motor Speed → REJECTED",
-        "plc_reason": "PLC rejected the requested speed because it exceeded the configured safety limit."
-    },
-    {
-        "scada_cmd": "Set Tank Pressure → 135 PSI",
-        "scada_reason": "Requested pressure exceeds the configured safe limit of 100 PSI.",
-        "plc_cmd": "Tank Pressure → ALARM",
-        "plc_reason": "PLC physical guardian blocked pressure change exceeding 100 PSI."
-    },
-    {
-        "scada_cmd": "Set Cooling Valve → 105°",
-        "scada_reason": "The requested valve angle exceeds the configured physical safety limit of 90°.",
-        "plc_cmd": "Cooling Valve → FAULT",
-        "plc_reason": "PLC reported that the requested operation could not be completed because the value exceeded safety limits."
-    },
-    {
-        "scada_cmd": "Rapid Valve Override",
-        "scada_reason": "High frequency command burst detected from SCADA endpoint exceeding rate limit.",
-        "plc_cmd": "Valve Control → BLOCKED",
-        "plc_reason": "PLC rate limiter dropped high frequency command request."
-    },
-    {
-        "scada_cmd": "Replay Command TX-4821",
-        "scada_reason": "Replay attack detected: duplicate sequence nonce received.",
-        "plc_cmd": "Sequence Nonce → INVALID",
-        "plc_reason": "PLC rejected command packet due to invalid sequence identifier."
+    with _lock:
+
+        _scada_to_plc.appendleft(event)
+
+        _metrics["total"] += 1
+
+        if verdict == "PASS":
+            _metrics["pass"] += 1
+
+        elif verdict == "DROP":
+            _metrics["drop"] += 1
+
+
+# =========================================================
+# PLC -> SCADA EVENT
+# =========================================================
+
+def add_plc_event(event):
+
+    event = {
+        "tx_id": _short_tx_id(
+            event.get("tx_id")
+        ),
+
+        "command": event.get(
+            "command",
+            "-"
+        ),
+
+        "verdict": str(
+            event.get(
+                "verdict",
+                "PASS"
+            )
+        ).upper(),
+
+        "reason": event.get(
+            "reason",
+            "PLC confirmed the requested value."
+        ),
+
+        "latency_ms": event.get(
+            "latency_ms",
+            0
+        ),
+
+        "timestamp": _format_time(
+            event.get("timestamp")
+        ),
     }
-]
+
+    with _lock:
+
+        _plc_to_scada.appendleft(
+            event
+        )
 
 
-def seed_initial_decisions():
-    now = time.time()
-    for i in range(15, 0, -1):
-        t_stamp = datetime.fromtimestamp(now - (i * 3)).strftime("%H:%M:%S")
-        is_drop = random.random() < 0.15
-        tx_raw = uuid.uuid4().hex[:4].upper()
-        latency_scada = round(random.uniform(2.1, 4.2), 1)
-        latency_plc = round(random.uniform(1.8, 3.9), 1)
+# =========================================================
+# TELEMETRY
+# =========================================================
 
-        if is_drop:
-            pair = random.choice(DROP_COMMAND_PAIRS)
-            verdict = "DROP"
-        else:
-            pair = random.choice(PASS_COMMAND_PAIRS)
-            verdict = "PASS"
+def update_telemetry(registers):
 
-        # SCADA -> PLC Event
-        dashboard_state["scada_to_plc"]["decision_log"].append({
-            "tx_id": f"TX-{tx_raw}",
-            "command": pair["scada_cmd"],
-            "verdict": verdict,
-            "reason": pair["scada_reason"],
-            "latency_ms": latency_scada,
-            "timestamp": t_stamp
-        })
+    with _lock:
 
-        # PLC -> SCADA Event
-        dashboard_state["plc_to_scada"]["decision_log"].append({
-            "tx_id": f"PLC-{tx_raw}",
-            "command": pair["plc_cmd"],
-            "verdict": verdict,
-            "reason": pair["plc_reason"],
-            "latency_ms": latency_plc,
-            "timestamp": t_stamp
-        })
+        for name in _telemetry:
 
-    # Seed CPU history
-    for i in range(20, 0, -1):
-        t_label = datetime.fromtimestamp(now - (i * 3)).strftime("%H:%M:%S")
-        load = round(random.uniform(28.0, 36.0), 1)
-        dashboard_state["cpu_history"].append({
-            "time": t_label,
-            "cpu_load": load
-        })
+            if name in registers:
 
-seed_initial_decisions()
+                try:
+
+                    _telemetry[name] = float(
+                        registers[name]
+                    )
+
+                except (
+                    ValueError,
+                    TypeError
+                ):
+
+                    pass
 
 
-def generate_simulated_event(force_attack=False):
-    with state_lock:
-        now_str = datetime.now().strftime("%H:%M:%S")
-        tx_raw = uuid.uuid4().hex[:4].upper()
-        tx_scada = f"TX-{tx_raw}"
-        tx_plc = f"PLC-{tx_raw}"
+# =========================================================
+# CPU HISTORY
+# =========================================================
 
-        if force_attack:
-            is_drop = True
-            pair = random.choice(DROP_COMMAND_PAIRS)
-        else:
-            is_drop = random.random() < 0.12
-            pair = random.choice(DROP_COMMAND_PAIRS) if is_drop else random.choice(PASS_COMMAND_PAIRS)
+def update_cpu_history():
 
-        verdict = "DROP" if is_drop else "PASS"
-        latency_scada = round(random.uniform(2.1, 4.8 if is_drop else 3.5), 1)
-        latency_plc = round(random.uniform(1.8, 4.2 if is_drop else 3.1), 1)
+    if psutil is None:
+        return
 
-        # Update Counts
-        dashboard_state["scada_to_plc"]["total_requests"] += 1
-        dashboard_state["plc_to_scada"]["total_requests"] += 1
+    try:
 
-        if is_drop:
-            dashboard_state["scada_to_plc"]["drop_count"] += 1
-            dashboard_state["plc_to_scada"]["drop_count"] += 1
-        else:
-            dashboard_state["scada_to_plc"]["pass_count"] += 1
-            dashboard_state["plc_to_scada"]["pass_count"] += 1
+        cpu = psutil.cpu_percent(
+            interval=None
+        )
 
-        # Append SCADA -> PLC Event
-        scada_event = {
-            "tx_id": tx_scada,
-            "command": pair["scada_cmd"],
-            "verdict": verdict,
-            "reason": pair["scada_reason"],
-            "latency_ms": latency_scada,
-            "timestamp": now_str
-        }
-        dashboard_state["scada_to_plc"]["decision_log"].insert(0, scada_event)
-        if len(dashboard_state["scada_to_plc"]["decision_log"]) > 40:
-            dashboard_state["scada_to_plc"]["decision_log"].pop()
+        with _lock:
 
-        # Append PLC -> SCADA Event
-        plc_event = {
-            "tx_id": tx_plc,
-            "command": pair["plc_cmd"],
-            "verdict": verdict,
-            "reason": pair["plc_reason"],
-            "latency_ms": latency_plc,
-            "timestamp": now_str
-        }
-        dashboard_state["plc_to_scada"]["decision_log"].insert(0, plc_event)
-        if len(dashboard_state["plc_to_scada"]["decision_log"]) > 40:
-            dashboard_state["plc_to_scada"]["decision_log"].pop()
+            _cpu_history.append({
+                "time": time.strftime(
+                    "%H:%M:%S"
+                ),
+                "value": round(
+                    float(cpu),
+                    1
+                )
+            })
 
-        # Fluctuate telemetry values
-        registers = dashboard_state["telemetry"]["registers"]
-        if not is_drop and "pressure" in pair:
-            registers["TANK_PRESSURE"] = pair["pressure"]
-        elif not is_drop and "speed" in pair:
-            registers["CONVEYOR_SPEED"] = pair["speed"]
-        elif not is_drop and "valve" in pair:
-            registers["COOLING_VALVE"] = pair["valve"]
-        else:
-            registers["TANK_PRESSURE"] = round(min(100.0, max(0.0, registers["TANK_PRESSURE"] + random.uniform(-1.0, 1.0))), 1)
-            registers["CONVEYOR_SPEED"] = round(min(120.0, max(0.0, registers["CONVEYOR_SPEED"] + random.uniform(-1.2, 1.2))), 1)
-            registers["COOLING_VALVE"] = round(min(90.0, max(0.0, registers["COOLING_VALVE"] + random.uniform(-0.8, 0.8))), 1)
-
-        # CPU load calculation
-        cpu_target = random.uniform(65.0, 85.0) if is_drop else random.uniform(25.0, 36.0)
-        current_cpu = dashboard_state["telemetry"]["cpu_load"]
-        new_cpu = round(current_cpu * 0.4 + cpu_target * 0.6, 1)
-        dashboard_state["telemetry"]["cpu_load"] = new_cpu
-        dashboard_state["telemetry"]["timestamp"] = int(time.time())
-
-        # Update CPU history
-        dashboard_state["cpu_history"].append({
-            "time": now_str,
-            "cpu_load": new_cpu
-        })
-        if len(dashboard_state["cpu_history"]) > 25:
-            dashboard_state["cpu_history"].pop(0)
-
-        return scada_event, plc_event
+    except Exception:
+        pass
 
 
-# Background thread daemon
-def background_simulator():
+def _cpu_loop():
+
+    if psutil is not None:
+
+        psutil.cpu_percent(
+            interval=None
+        )
+
     while True:
-        try:
-            generate_simulated_event()
-        except Exception as e:
-            print(f"[Simulator Error] {e}")
-        time.sleep(2.5)
+
+        update_cpu_history()
+
+        time.sleep(1)
 
 
-# ==========================================
-# FLASK WEB ROUTE (SINGLE DASHBOARD SCREEN)
-# ==========================================
+# =========================================================
+# ROUTES
+# =========================================================
+
 @app.route("/")
 def index():
-    """Renders the unified Industrial Mind Dashboard."""
-    return render_template("index.html")
+
+    return render_template(
+        "index.html",
+        machines=MACHINES
+    )
 
 
-# ==========================================
-# CONSOLIDATED API DATA ENDPOINT
-# ==========================================
-@app.route("/api/dashboard", methods=["GET"])
-def get_dashboard_data():
-    """Returns overview KPIs, SCADA->PLC log, PLC->SCADA log, telemetry, and CPU history."""
-    with state_lock:
-        total_msg = dashboard_state["scada_to_plc"]["total_requests"] + dashboard_state["plc_to_scada"]["total_requests"]
-        total_pass = dashboard_state["scada_to_plc"]["pass_count"] + dashboard_state["plc_to_scada"]["pass_count"]
-        total_drop = dashboard_state["scada_to_plc"]["drop_count"] + dashboard_state["plc_to_scada"]["drop_count"]
+@app.route(
+    "/api/security-event",
+    methods=["POST"]
+)
+def security_event():
 
-        return jsonify({
-            "overview": {
-                "total_requests": total_msg,
-                "pass": total_pass,
-                "drop": total_drop
-            },
-            "scada_to_plc": list(dashboard_state["scada_to_plc"]["decision_log"]),
-            "plc_to_scada": list(dashboard_state["plc_to_scada"]["decision_log"]),
-            "telemetry": dict(dashboard_state["telemetry"]),
-            "cpu_history": list(dashboard_state["cpu_history"])
-        })
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
+    direction = data.get(
+        "direction",
+        "scada_to_plc"
+    )
 
-@app.route("/api/trigger-attack", methods=["POST"])
-def trigger_attack():
-    scada_ev, plc_ev = generate_simulated_event(force_attack=True)
+    if direction == "scada_to_plc":
+
+        add_scada_event(data)
+
+    elif direction == "plc_to_scada":
+
+        add_plc_event(data)
+
     return jsonify({
-        "status": "success",
-        "scada_event": scada_ev,
-        "plc_event": plc_ev
+        "success": True
     })
 
 
-@app.route("/api/reset", methods=["POST"])
-def reset_metrics():
-    with state_lock:
-        dashboard_state["scada_to_plc"]["total_requests"] = 0
-        dashboard_state["scada_to_plc"]["pass_count"] = 0
-        dashboard_state["scada_to_plc"]["drop_count"] = 0
-        dashboard_state["scada_to_plc"]["decision_log"].clear()
+@app.route(
+    "/api/telemetry",
+    methods=["POST"]
+)
+def telemetry():
 
-        dashboard_state["plc_to_scada"]["total_requests"] = 0
-        dashboard_state["plc_to_scada"]["pass_count"] = 0
-        dashboard_state["plc_to_scada"]["drop_count"] = 0
-        dashboard_state["plc_to_scada"]["decision_log"].clear()
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
-        dashboard_state["cpu_history"].clear()
-        seed_initial_decisions()
-    return jsonify({"status": "reset_complete"})
+    registers = data.get(
+        "registers",
+        data
+    )
 
+    update_telemetry(
+        registers
+    )
+
+    return jsonify({
+        "success": True
+    })
+
+
+@app.route(
+    "/api/dashboard",
+    methods=["GET"]
+)
+def dashboard_data():
+
+    with _lock:
+
+        return jsonify({
+
+            "overview": {
+                "total_requests":
+                    _metrics["total"],
+
+                "pass":
+                    _metrics["pass"],
+
+                "drop":
+                    _metrics["drop"],
+            },
+
+            "scada_to_plc":
+                list(_scada_to_plc),
+
+            "plc_to_scada":
+                list(_plc_to_scada),
+
+            "telemetry": {
+
+                "registers":
+                    dict(_telemetry),
+
+                "cpu_load":
+                    (
+                        _cpu_history[-1]["value"]
+                        if _cpu_history
+                        else 0
+                    ),
+            },
+
+            "cpu_history":
+                list(_cpu_history),
+        })
+
+
+# =========================================================
+# BLOCKED IPS (reads logs/blocked_attacks.jsonl)
+# =========================================================
+
+@app.route(
+    "/api/blocked-ips",
+    methods=["GET"]
+)
+def blocked_ips():
+
+    attack_type = request.args.get("attack_type", "")
+    ip_query = request.args.get("ip", "")
+
+    records = _attack_log_reader.records()
+
+    filtered = attack_log.filter_records(
+        records,
+        attack_type=attack_type,
+        ip_query=ip_query
+    )
+
+    return jsonify({
+        "log_file": os.path.relpath(attack_log.LOG_FILE, PROJECT_ROOT),
+        "total_records": len(records),
+        "matching_records": len(filtered),
+        "attack_types": attack_log.attack_type_counts(records),
+        "sources": attack_log.aggregate_by_ip(filtered),
+    })
+
+
+@app.route(
+    "/api/blocked-ips/<path:ip>",
+    methods=["GET"]
+)
+def blocked_ip_detail(ip):
+
+    attack_type = request.args.get("attack_type", "")
+
+    records = [
+        r for r in _attack_log_reader.records()
+        if str(r.get("source_ip")) == ip
+    ]
+
+    records = attack_log.filter_records(
+        records,
+        attack_type=attack_type
+    )
+
+    records.sort(
+        key=lambda r: r.get("timestamp") or 0,
+        reverse=True
+    )
+
+    return jsonify({
+        "source_ip": ip,
+        "count": len(records),
+        "attacks": records[:500],
+    })
+
+
+# =========================================================
+# ATTACK TRIGGER
+# =========================================================
+
+@app.route(
+    "/api/trigger-attack",
+    methods=["POST"]
+)
+def trigger_attack():
+
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    attack = data.get(
+        "attack"
+    )
+
+    allowed = {
+        "flood",
+        "impossible-command",
+        "replay",
+        "false-injection",
+        "cross-register",
+        "hmac-missing",
+        "hmac-tamper",
+        "hmac-forged",
+        "delayed-replay",
+    }
+
+    # Optional local address(es) for the attacker socket to bind to.
+    # The middleware still records whatever address the connection
+    # actually comes from.
+    source_ip = str(data.get("source_ip") or "").strip()
+    for ip in filter(None, (x.strip() for x in source_ip.split(","))):
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return jsonify({
+                "success": False,
+                "error": f"Invalid source IP: {ip}"
+            }), 400
+
+    if attack not in allowed:
+
+        return jsonify({
+            "success": False,
+            "error": "Invalid attack type"
+        }), 400
+
+    try:
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "attacker.attacker",
+            attack
+        ]
+
+        if source_ip:
+            cmd += ["--source-ip", source_ip]
+
+        subprocess.Popen(
+            cmd,
+            cwd=PROJECT_ROOT
+        )
+
+        print(
+            f"[DASHBOARD] "
+            f"Launching attack: {attack}"
+        )
+
+        return jsonify({
+            "success": True,
+            "attack": attack
+        })
+
+    except Exception as e:
+
+        print(
+            f"[DASHBOARD] "
+            f"Attack failed: {e}"
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# =========================================================
+# RESET
+# =========================================================
+
+@app.route(
+    "/api/reset",
+    methods=["POST"]
+)
+def reset_dashboard():
+
+    global _event_counter
+
+    with _lock:
+
+        _scada_to_plc.clear()
+
+        _plc_to_scada.clear()
+
+        _cpu_history.clear()
+
+        _metrics["total"] = 0
+        _metrics["pass"] = 0
+        _metrics["drop"] = 0
+
+        for m in MACHINES:
+            _telemetry[m["name"]] = float(m["initial"])
+
+        _event_counter = 0
+        _tx_id_map.clear()
+
+    print(
+        "[DASHBOARD] Reset"
+    )
+
+    return jsonify({
+        "success": True
+    })
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
-    # Start single background simulator thread
-    sim_thread = Thread(target=background_simulator, daemon=True)
-    sim_thread.start()
 
-    port = int(os.environ.get("PORT", 5050))
-    print("\n=======================================================")
-    print(" 🛡️ INDUSTRIAL MIND SECURITY MONITORING SYSTEM ")
-    print(f" Unified Dashboard: http://127.0.0.1:{port}")
-    print("=======================================================\n")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    threading.Thread(
+        target=_cpu_loop,
+        daemon=True
+    ).start()
 
+    print()
+    print("=" * 60)
+    print(
+        " 🛡️ INDUSTRIAL MIND SECURITY MONITORING SYSTEM"
+    )
+    print("=" * 60)
+    print(
+        " Dashboard: http://127.0.0.1:5050"
+    )
+    print(
+        " Security API: "
+        "http://127.0.0.1:5050/api/security-event"
+    )
+    print("=" * 60)
+    print()
+
+    app.run(
+        host="127.0.0.1",
+        port=5050,
+        debug=False,
+        use_reloader=False
+    )

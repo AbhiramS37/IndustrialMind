@@ -1,172 +1,321 @@
 """
-scada/scada.py — SCADA operator client for Industrial Mind.
+scada/scada.py
 
-Sends periodic, small, in-bounds Modbus writes to the middleware (or directly
-to the PLC for standalone testing). Simulates a human operator slowly adjusting
-plant setpoints: opening the cooling valve 1° at a time, nudging the conveyor
-speed, bleeding tank pressure.
+SCADA operator simulation.
 
-Usage (standalone test — point directly at Sharon's plc.py):
-    python -m scada.scada --host 127.0.0.1 --port 5020
+Sends one Modbus write every 2 seconds to the middleware.
 
-Usage (through middleware — normal operation):
-    python -m scada.scada --host 127.0.0.1 --port 5502
+Every command is an HMAC-SHA256 signed frame (Modbus FC16 to FRAME_BASE,
+see docs/hmac_auth.py). The shared secret comes from IM_HMAC_SECRET /
+IM_HMAC_SECRET_FILE / config/hmac_secret.key - the same source the
+middleware uses.
+
+Flow:
+    SCADA -> Middleware :5021 -> PLC :5020
 """
 
 import argparse
+import random
 import time
 import uuid
-import random
 
 from pymodbus.client import ModbusTcpClient
 
-from docs.interfaces import (
-    make_command,
-    REGISTER_MAP,
-    TANK_PRESSURE,
-    CONVEYOR_SPEED,
-    COOLING_VALVE,
-)
+from docs.interfaces import REGISTER_MAP, MACHINES, NUM_REGISTERS, FRAME_BASE, from_raw
+from docs import hmac_auth
 
-# ── Operator profile ────────────────────────────────────────────────────────
-# Each register has a setpoint the "operator" is slowly moving toward and a
-# step size per write (kept small and realistic).
 
-SCADA_SOURCE_IP = "192.168.1.10"    # must be in the cyber_agent whitelist
-FUNCTION_CODE   = 6                  # Write Single Register
-_SCALE          = 10                 # Must match plc.py's _SCALE
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-_OPERATOR_PROFILE = {
-    TANK_PRESSURE: {
-        "target":   60.0,    # PSI — where the operator wants to end up
-        "step":      1.0,    # PSI per write
-        "interval":  2.0,    # seconds between writes to this register
-    },
-    CONVEYOR_SPEED: {
-        "target":   80.0,    # RPM
-        "step":      2.0,
-        "interval":  3.0,
-    },
-    COOLING_VALVE: {
-        "target":   60.0,    # degrees open
-        "step":      1.0,
-        "interval":  1.5,
-    },
+# The source IP seen by the middleware is the real address of this
+# process's TCP connection; it is not configured here.
+
+FUNCTION_CODE = 16   # signed frames use write-multiple-registers
+SCALE = 10
+
+COMMAND_INTERVAL = 2.0
+
+
+# ============================================================
+# OPERATOR PROFILES
+# ============================================================
+
+# Built from the central machine config (docs/interfaces.MACHINES).
+OPERATOR_PROFILES = {
+    m["name"]: {
+        "register": m["register"],
+        "target": float(m["operator"]["target"]),
+        "step": float(m["operator"]["step"]),
+        "current": float(m["initial"]),
+    }
+    for m in MACHINES
 }
 
 
-# ── Internal state ───────────────────────────────────────────────────────────
+# ============================================================
+# SETPOINT GENERATION
+# ============================================================
 
-_last_write_time = {reg: 0.0 for reg in _OPERATOR_PROFILE}
-_current_setpoint = {
-    TANK_PRESSURE:  50.0,   # start values (match PLC defaults)
-    CONVEYOR_SPEED:  0.0,
-    COOLING_VALVE:  45.0,
-}
-
-
-def _next_setpoint(register: int) -> float:
-    """Advance the operator's setpoint one step toward the target, staying
-    within the register's safe range."""
-    profile = _OPERATOR_PROFILE[register]
-    current = _current_setpoint[register]
-    target  = profile["target"]
-    step    = profile["step"]
-
-    lo = REGISTER_MAP[register]["min"]
-    hi = REGISTER_MAP[register]["max"]
-
-    if current < target:
-        new_val = min(current + step, target)
-    elif current > target:
-        new_val = max(current - step, target)
-    else:
-        # At target — occasionally drift ±step to simulate human micro-adjustments
-        drift = random.choice([-step, 0.0, step])
-        new_val = current + drift
-
-    new_val = max(lo, min(hi, new_val))
-    _current_setpoint[register] = new_val
-    return new_val
-
-
-def _float_to_raw(value: float) -> int:
-    """Convert float plant value to raw 16-bit int using the shared scale factor."""
-    return max(0, min(65535, int(round(value * _SCALE))))
-
-
-def send_write(client: ModbusTcpClient, register: int, value: float) -> dict | None:
+def _sync_with_plant(name, actual):
     """
-    Send a single Modbus write to the server and return the command dict
-    that was sent (for logging / testing). Returns None if the connection fails.
+    If something else moved the plant well away from the operator's own
+    setpoint (another operator, an attack that got through, a reset), the
+    operator continues from the ACTUAL reading instead of issuing a large
+    jump back to a stale value.
     """
-    raw = _float_to_raw(value)
-    result = client.write_register(register, raw)
 
-    if result.isError():
-        print(f"[SCADA] Modbus error writing register {register}: {result}")
-        return None
-
-    command = make_command(
-        tx_id        = str(uuid.uuid4()),
-        timestamp    = time.time(),
-        source_ip    = SCADA_SOURCE_IP,
-        function_code= FUNCTION_CODE,
-        register     = register,
-        value        = value,
-    )
-    print(
-        f"[SCADA] WRITE reg={REGISTER_MAP[register]['name']} "
-        f"value={value:.2f} {REGISTER_MAP[register]['unit']} "
-        f"tx={command['tx_id'][:8]}…"
-    )
-    return command
-
-
-def run_operator_loop(host: str = "127.0.0.1", port: int = 5502):
-    """
-    Main loop: connect to the middleware (or PLC), then send periodic,
-    realistic Modbus writes representing a human operator.
-
-    Runs indefinitely until interrupted (Ctrl-C).
-
-    Args:
-        host: Target server host.
-        port: Target server port.  5502 = middleware, 5020 = PLC directly.
-    """
-    print(f"[SCADA] Connecting to {host}:{port} …")
-    client = ModbusTcpClient(host=host, port=port)
-
-    if not client.connect():
-        print(f"[SCADA] ERROR: Could not connect to {host}:{port}")
+    if actual is None:
         return
 
-    print("[SCADA] Connected. Starting operator loop. Press Ctrl-C to stop.")
+    profile = OPERATOR_PROFILES[name]
+
+    if abs(actual - profile["current"]) > 2 * profile["step"]:
+        profile["current"] = actual
+
+
+def _read_plant(client):
+    """Read the live plant values the middleware mirrors from the PLC."""
 
     try:
+        result = client.read_holding_registers(
+            0,
+            count=NUM_REGISTERS,
+            slave=1
+        )
+
+        if result.isError():
+            return {}
+
+        return {
+            m["name"]: from_raw(raw)
+            for m, raw in zip(MACHINES, result.registers)
+        }
+
+    except Exception:
+        return {}
+
+
+def _next_setpoint(name):
+    """
+    Gradually move the simulated operator value
+    toward the target value.
+    """
+
+    profile = OPERATOR_PROFILES[name]
+
+    current = profile["current"]
+    target = profile["target"]
+    step = profile["step"]
+
+    if current < target:
+        current = min(current + step, target)
+
+    elif current > target:
+        current = max(current - step, target)
+
+    profile["current"] = current
+
+    return current
+
+
+# ============================================================
+# VALUE CONVERSION
+# ============================================================
+
+def _to_raw(register, value):
+    """
+    Convert engineering value into Modbus register value.
+    """
+
+    config = REGISTER_MAP[register]
+
+    minimum = config["min"]
+    maximum = config["max"]
+
+    value = max(minimum, min(maximum, value))
+
+    return int(round(value * SCALE))
+
+
+# ============================================================
+# SEND MODBUS WRITE
+# ============================================================
+
+def send_write(client, register, value):
+    """
+    Send one HMAC-signed command frame to middleware.
+    """
+
+    raw_value = _to_raw(register, value)
+
+    frame = hmac_auth.build_frame(
+        register,
+        raw_value / SCALE
+    )
+
+    tx_id = str(uuid.uuid4())[:8]
+
+    register_name = REGISTER_MAP[register]["name"]
+
+    print(
+        f"[SCADA] WRITE "
+        f"tx={tx_id} "
+        f"reg={register_name} "
+        f"value={value:.2f}"
+    )
+
+    try:
+        result = client.write_registers(
+            address=FRAME_BASE,
+            values=frame,
+            slave=1
+        )
+
+        if result.isError():
+            print(
+                f"[SCADA] WRITE FAILED "
+                f"tx={tx_id} "
+                f"reg={register_name}"
+            )
+
+        else:
+            print(
+                f"[SCADA] WRITE SENT "
+                f"tx={tx_id} "
+                f"reg={register_name} "
+                f"value={value:.2f}"
+            )
+
+    except Exception as e:
+        print(
+            f"[SCADA] ERROR "
+            f"tx={tx_id}: {e}"
+        )
+
+
+# ============================================================
+# OPERATOR SIMULATION
+# ============================================================
+
+def run_operator_loop(host="127.0.0.1", port=5021):
+    """
+    Connect to middleware and continuously simulate
+    normal SCADA operator commands.
+
+    Exactly ONE command is sent every 2 seconds.
+    """
+
+    # Fail fast if the shared HMAC secret is misconfigured.
+    hmac_auth.get_secret()
+
+    client = ModbusTcpClient(
+        host,
+        port=port
+    )
+
+    print()
+    print("=" * 60)
+    print(" SCADA OPERATOR SIMULATION")
+    print("=" * 60)
+
+    print(
+        f"[SCADA] Connecting to "
+        f"{host}:{port} ..."
+    )
+
+    if not client.connect():
+        print("[SCADA] Connection failed.")
+        return
+
+    print("[SCADA] Connected successfully.")
+    print(
+        "[SCADA] Sending ONE command every "
+        f"{COMMAND_INTERVAL:.0f} seconds."
+    )
+    print("[SCADA] Press Ctrl-C to stop.")
+    print()
+
+    # Rotate through every configured machine.
+    registers = [
+        m["name"] for m in MACHINES
+    ]
+
+    index = 0
+
+    try:
+
         while True:
-            now = time.time()
 
-            for register, profile in _OPERATOR_PROFILE.items():
-                if now - _last_write_time[register] >= profile["interval"]:
-                    value = _next_setpoint(register)
-                    send_write(client, register, value)
-                    _last_write_time[register] = now
+            name = registers[index]
 
-            time.sleep(0.1)   # tight poll; writes are gated by per-register intervals
+            profile = OPERATOR_PROFILES[name]
+
+            register = profile["register"]
+
+            _sync_with_plant(
+                name,
+                _read_plant(client).get(name)
+            )
+
+            value = _next_setpoint(name)
+
+            send_write(
+                client=client,
+                register=register,
+                value=value
+            )
+
+            # Move to the next parameter.
+            index = (index + 1) % len(registers)
+
+            # Wait exactly 2 seconds before
+            # generating the next command.
+            time.sleep(COMMAND_INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n[SCADA] Operator loop stopped.")
+
+        print()
+        print("[SCADA] Operator simulation stopped.")
+
     finally:
+
         client.close()
 
+        print("[SCADA] Connection closed.")
 
-# ── CLI entry point ──────────────────────────────────────────────────────────
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Industrial Mind SCADA simulator"
+    )
+
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Middleware host"
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5021,
+        help="Middleware Modbus port"
+    )
+
+    args = parser.parse_args()
+
+    run_operator_loop(
+        host=args.host,
+        port=args.port
+    )
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Industrial Mind SCADA client")
-    parser.add_argument("--host", default="127.0.0.1", help="Target host")
-    parser.add_argument("--port", type=int, default=5502,
-                        help="Target port (5502=middleware, 5020=PLC direct)")
-    args = parser.parse_args()
-    run_operator_loop(args.host, args.port)
+    main()

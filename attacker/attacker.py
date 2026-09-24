@@ -1,181 +1,623 @@
 """
-attacker/attacker.py — Cyber Attack Demonstration Tool for Industrial Mind
+attacker/attacker.py
 
-Demonstrates four cyber attack vectors against the security middleware:
-1. flood — High-frequency command burst triggering RATE_LIMIT_EXCEEDED (Cyber Agent).
-2. false-injection — False telemetry feedback payload triggering TELEMETRY_MISMATCH (Physical Agent).
-3. impossible-command — Out-of-bounds physical command triggering PHYSICS_VIOLATION (Physical Agent).
-4. replay — Duplicate payload retransmitted within replay window triggering REPLAY_DETECTED (Cyber Agent).
+Real Modbus attack client for the Industrial Mind demo.
+
+Middleware:
+    127.0.0.1:5021
+
+PLC:
+    127.0.0.1:5020
+
+Attacks (original):
+    flood                  signed burst above the 5 req/s limit     -> RATE_LIMIT_EXCEEDED
+    impossible-command     signed 999 PSI tank pressure              -> OUT_OF_BOUNDS
+    replay                 byte-identical re-send of a signed frame  -> REPLAY_DETECTED
+    false-injection        legit command, then direct PLC write      (bypasses middleware)
+
+Attacks (new):
+    cross-register         low-and-slow multi-machine attack: each step is
+                           in-bounds and within rate limits, but the combined
+                           heater/cooling state is unsafe  -> CROSS_REGISTER_VIOLATION
+    hmac-missing           plain unsigned FC6 write                  -> HMAC_MISSING
+    hmac-tamper            valid signed frame, value altered in transit -> HMAC_INVALID
+    hmac-forged            frame signed with a guessed key           -> HMAC_INVALID
+    delayed-replay         correctly signed frame that is 5 minutes old -> HMAC_EXPIRED
+
+Threat model:
+    flood / impossible-command / replay / cross-register / delayed-replay model
+    a COMPROMISED ENGINEERING WORKSTATION that holds the shared HMAC key
+    (insider). HMAC cannot stop an attacker who owns the key; the cyber rate /
+    replay checks and the Physical Agent must. The hmac-* attacks model an
+    external attacker WITHOUT the key.
+
+Source IP:
+    The middleware records the real TCP source address. To attack from a
+    different address, bind the client with --source-ip. On Linux any
+    127.x.y.z address works out of the box; on macOS add an alias first:
+        sudo ifconfig lo0 alias 127.0.0.2 up
+    Or run the attacker on another machine with --host <middleware-ip>.
+
+Usage:
+
+    python attacker/attacker.py flood
+    python attacker/attacker.py impossible-command
+    python attacker/attacker.py replay
+    python attacker/attacker.py false-injection
+    python attacker/attacker.py cross-register
+    python attacker/attacker.py hmac-missing --source-ip 127.0.0.2
+    python attacker/attacker.py hmac-tamper  --source-ip 127.0.0.2,127.0.0.3
 """
 
+import argparse
+import os
+import secrets
 import sys
 import time
-from pymodbus.client import ModbusTcpClient
 
-from docs.interfaces import make_command
-from middleware.cyber_agent import check as cyber_check
-from middleware.physical_agent import check_command as phys_check_command, check_feedback as phys_check_feedback
-from middleware.orchestrator import decide
+# Allow `python attacker/attacker.py ...` as well as `python -m attacker.attacker`.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pymodbus.client import ModbusTcpClient  # noqa: E402
+
+from docs.interfaces import (  # noqa: E402
+    MACHINES,
+    NUM_REGISTERS,
+    FRAME_BASE,
+    TANK_PRESSURE,
+    CONVEYOR_SPEED,
+    COOLING_VALVE,
+    HEATER_TEMP,
+    to_raw,
+    from_raw,
+)
+from docs import hmac_auth  # noqa: E402
+
+
+MIDDLEWARE_HOST = "127.0.0.1"
+MIDDLEWARE_PORT = 5021
 
 PLC_HOST = "127.0.0.1"
 PLC_PORT = 5020
-SCALE = 10
+
+UNIT_ID = 1
+
+_NAME = {m["register"]: m["name"] for m in MACHINES}
+
+# Set from the command line.
+_SOURCE_IP = None
 
 
-def send_through_middleware(command_dict: dict, is_telemetry_feedback: bool = False) -> dict:
-    """
-    Routes an attack command payload through the complete
-    Cyber Agent -> Physical Agent -> Orchestrator security pipeline.
-    If the decision is PASS, executes the write to the real PLC.
-    """
-    start_t = time.time()
+# ---------------------------------------------------------
+# MODBUS CLIENT HELPER
+# ---------------------------------------------------------
 
-    if is_telemetry_feedback:
-        # Upstream path: Cyber Agent is None, Physical Agent validates telemetry feedback
-        phys_v = phys_check_feedback(command_dict)
-        decision = decide(None, phys_v, start_t)
-        cyber_v = {"tx_id": command_dict["tx_id"], "pass": True, "reason": "N/A (Upstream)", "agent": "cyber"}
-    else:
-        # Downstream path: Cyber Agent -> Physical Agent -> Orchestrator
-        cyber_v = cyber_check(command_dict)
-        phys_v = phys_check_command(command_dict)
+def connect(host, port):
 
-        reg = command_dict.get("register", "N/A")
-        val = command_dict.get("value", "N/A")
-        phys_v["command"] = f"WRITE_REGISTER {hex(reg) if isinstance(reg, int) else reg} {val}"
+    kwargs = {}
+    if _SOURCE_IP:
+        kwargs["source_address"] = (_SOURCE_IP, 0)
 
-        decision = decide(cyber_v, phys_v, start_t)
+    client = ModbusTcpClient(
+        host=host,
+        port=port,
+        timeout=2,
+        **kwargs
+    )
 
-        # Forward to PLC ONLY if decision is PASS
-        if decision["verdict"] == "PASS":
-            client = ModbusTcpClient(PLC_HOST, port=PLC_PORT)
-            if client.connect():
-                try:
-                    raw_val = int(command_dict["value"] * SCALE)
-                    client.write_register(address=command_dict["register"], value=raw_val, slave=1)
-                except Exception as e:
-                    print(f"[PLC Write Warning] {e}")
-                finally:
-                    client.close()
+    try:
+        ok = client.connect()
+    except OSError as e:
+        ok = False
+        print(f"[ATTACKER] Socket error: {e}")
 
-    return {
-        "command": command_dict,
-        "cyber_verdict": cyber_v,
-        "physical_verdict": phys_v,
-        "decision": decision
-    }
+    if not ok:
 
-
-def attack_flood():
-    print("\n--- [ATTACK MODE: FLOOD] ---")
-    source_ip = "192.168.1.10"
-    results = []
-
-    # Send a controlled burst of 7 rapid requests (limit is 5/sec)
-    for i in range(7):
-        tx_id = f"ATK-FLD-{int(time.time()*1000)}-{i}"
-        cmd = make_command(
-            tx_id=tx_id,
-            timestamp=time.time(),
-            source_ip=source_ip,
-            function_code=6,
-            register=1,
-            value=40.0 + i
+        print(
+            f"[ATTACKER] Failed to connect to "
+            f"{host}:{port}"
+            + (f" from {_SOURCE_IP}" if _SOURCE_IP else "")
         )
-        res = send_through_middleware(cmd)
-        results.append(res)
-        print(f"Request #{i+1} [{tx_id}]: Cyber={res['cyber_verdict']['reason']} | Physical={res['physical_verdict']['reason']} => Verdict={res['decision']['verdict']}")
+
+        if _SOURCE_IP:
+            print(
+                "[ATTACKER] Hint: the source address must exist on this host "
+                "(macOS: sudo ifconfig lo0 alias "
+                f"{_SOURCE_IP} up)"
+            )
+
+        return None
+
+    print(
+        f"[ATTACKER] Connected to "
+        f"{host}:{port}"
+        + (f" from {_SOURCE_IP}" if _SOURCE_IP else "")
+    )
+
+    return client
+
+
+def write_register(
+    client,
+    register,
+    value,
+):
+    """Plain, UNSIGNED single-register write (engineering units)."""
+
+    raw = to_raw(value)
+
+    result = client.write_register(
+        address=register,
+        value=raw,
+        slave=UNIT_ID,
+    )
+
+    if result.isError():
+
+        print(
+            f"[ATTACKER] Write failed: "
+            f"register={register}, value={value}"
+        )
+
+        return False
+
+    print(
+        f"[ATTACKER] Unsigned write sent: "
+        f"{_NAME.get(register, register)}={value}"
+    )
+
+    return True
+
+
+def send_frame(client, frame, label):
+    result = client.write_registers(
+        address=FRAME_BASE,
+        values=frame,
+        slave=UNIT_ID,
+    )
+
+    if result.isError():
+        print(f"[ATTACKER] Frame rejected at Modbus level: {label}")
+        return False
+
+    print(f"[ATTACKER] Frame sent: {label}")
+    return True
+
+
+def write_signed(client, register, value, key=None, timestamp_ms=None):
+    """Signed command frame. key=None uses the shared (stolen) key."""
+    frame = hmac_auth.build_frame(register, value, key=key, timestamp_ms=timestamp_ms)
+    return send_frame(client, frame, f"signed {_NAME.get(register, register)}={value}")
+
+
+def read_plant(client):
+    result = client.read_holding_registers(0, count=NUM_REGISTERS, slave=UNIT_ID)
+    if result.isError():
+        return {}
+    return {m["register"]: from_raw(raw) for m, raw in zip(MACHINES, result.registers)}
+
+
+# ---------------------------------------------------------
+# ATTACK 1 — FLOOD
+# ---------------------------------------------------------
+
+def flood_attack():
+
+    print("\n[ATTACK] RATE-LIMIT FLOOD")
+
+    client = connect(
+        MIDDLEWARE_HOST,
+        MIDDLEWARE_PORT
+    )
+
+    if client is None:
+        return
+
+    try:
+
+        base = read_plant(client).get(CONVEYOR_SPEED, 0.0)
+
+        # More than the cyber-agent limit of
+        # 5 requests / second. Tiny moves so the
+        # rate limiter is what stops them.
+
+        for i in range(10):
+
+            write_signed(
+                client,
+                register=CONVEYOR_SPEED,
+                value=round(base + 0.1 * (i + 1), 1)
+            )
+
+            time.sleep(0.05)
+
+    finally:
+
+        client.close()
+
+    print("[ATTACK] Flood complete.")
+
+
+# ---------------------------------------------------------
+# ATTACK 2 — IMPOSSIBLE COMMAND
+# ---------------------------------------------------------
+
+def impossible_command_attack():
+
+    print("\n[ATTACK] IMPOSSIBLE COMMAND")
+
+    client = connect(
+        MIDDLEWARE_HOST,
+        MIDDLEWARE_PORT
+    )
+
+    if client is None:
+        return
+
+    try:
+
+        # Tank pressure safe range:
+        # 0–100 PSI
+
+        write_signed(
+            client,
+            register=TANK_PRESSURE,
+            value=999
+        )
+
+    finally:
+
+        client.close()
+
+    print(
+        "[ATTACK] Impossible command complete."
+    )
+
+
+# ---------------------------------------------------------
+# ATTACK 3 — REPLAY
+# ---------------------------------------------------------
+
+def replay_attack():
+
+    print("\n[ATTACK] REPLAY")
+
+    client = connect(
+        MIDDLEWARE_HOST,
+        MIDDLEWARE_PORT
+    )
+
+    if client is None:
+        return
+
+    try:
+
+        register = CONVEYOR_SPEED
+        value = round(read_plant(client).get(register, 0.0) + 0.5, 1)
+
+        # Capture one legitimate signed frame ...
+        frame = hmac_auth.build_frame(register, value)
+
+        send_frame(client, frame, f"original {_NAME[register]}={value}")
+
         time.sleep(0.05)
 
-    return results
+        # ... and send the exact same bytes again.
+        # Valid HMAC, but the nonce was already used.
+        send_frame(client, frame, f"REPLAYED {_NAME[register]}={value}")
+
+    finally:
+
+        client.close()
+
+    print("[ATTACK] Replay complete.")
 
 
-def attack_false_injection():
-    print("\n--- [ATTACK MODE: FALSE INJECTION] ---")
-    tx_id = f"ATK-INJ-{int(time.time())}"
-    # Valid SCADA IP (192.168.1.10) & valid function code (6), but forged negative telemetry speed (-50.0 RPM)
-    # Exceeds physical bounds [0, 120] in REGISTER_MAP
-    cmd = make_command(
-        tx_id=tx_id,
-        timestamp=time.time(),
-        source_ip="192.168.1.10",
-        function_code=6,
-        register=1,  # CONVEYOR_SPEED
-        value=-50.0   # Physically impossible negative speed telemetry
+# ---------------------------------------------------------
+# ATTACK 4 — FALSE INJECTION
+# ---------------------------------------------------------
+
+def false_injection_attack():
+
+    print("\n[ATTACK] FALSE INJECTION")
+
+    # -----------------------------------------------------
+    # STEP 1
+    # Legitimate command through middleware
+    # -----------------------------------------------------
+
+    middleware = connect(
+        MIDDLEWARE_HOST,
+        MIDDLEWARE_PORT
     )
-    res = send_through_middleware(cmd, is_telemetry_feedback=True)
-    print(f"Payload: Register=1 (CONVEYOR_SPEED), Value=-50.0 RPM (Abnormal negative telemetry)")
-    print(f"Target Security Layer: Physical Agent telemetry validation (check_feedback)")
-    print(f"Physical Verdict: {res['physical_verdict']}")
-    print(f"Orchestrator Decision: {res['decision']}")
-    return res
 
+    if middleware is None:
+        return
 
-def attack_impossible_command():
-    print("\n--- [ATTACK MODE: IMPOSSIBLE COMMAND] ---")
-    tx_id = f"ATK-IMP-{int(time.time())}"
-    # Valid SCADA IP (192.168.1.10), valid function code (6), valid register index (0: TANK_PRESSURE)
-    # But physically impossible value (999.0 PSI > max 100.0 PSI in REGISTER_MAP)
-    cmd = make_command(
-        tx_id=tx_id,
-        timestamp=time.time(),
-        source_ip="192.168.1.10",
-        function_code=6,
-        register=0,   # TANK_PRESSURE
-        value=999.0   # Physically impossible pressure (> 100 PSI)
+    try:
+
+        current = read_plant(middleware).get(CONVEYOR_SPEED, 0.0)
+
+        write_signed(
+            middleware,
+            register=CONVEYOR_SPEED,
+            value=round(current + 1.0, 1)
+        )
+
+    finally:
+
+        middleware.close()
+
+    time.sleep(0.3)
+
+    # -----------------------------------------------------
+    # STEP 2
+    # Direct spoofed write to PLC
+    # -----------------------------------------------------
+
+    print(
+        "[ATTACK] Sending direct PLC spoof..."
     )
-    res = send_through_middleware(cmd)
-    print(f"Payload: Source IP=192.168.1.10, Register=0 (TANK_PRESSURE), Value=999.0 PSI")
-    print(f"Target Security Layer: Physical Agent command validation (check_command)")
-    print(f"Cyber Verdict: {res['cyber_verdict']}")
-    print(f"Physical Verdict: {res['physical_verdict']}")
-    print(f"Orchestrator Decision: {res['decision']}")
-    return res
+
+    plc = connect(
+        PLC_HOST,
+        PLC_PORT
+    )
+
+    if plc is None:
+        return
+
+    try:
+
+        # Deliberately different value.
+
+        write_register(
+            plc,
+            register=CONVEYOR_SPEED,
+            value=0
+        )
+
+    finally:
+
+        plc.close()
+
+    print(
+        "[ATTACK] False injection complete."
+    )
 
 
-def attack_replay():
-    print("\n--- [ATTACK MODE: REPLAY] ---")
-    source_ip = "192.168.1.10"
-    reg = 2
-    val = 30.0
+# ---------------------------------------------------------
+# ATTACK 5 — CROSS-REGISTER CORRELATION
+# ---------------------------------------------------------
 
-    # 1. First Legitimate Send
-    tx_1 = f"ATK-RPLY-LEGIT-{int(time.time())}"
-    cmd1 = make_command(tx_id=tx_1, timestamp=time.time(), source_ip=source_ip, function_code=6, register=reg, value=val)
-    res1 = send_through_middleware(cmd1)
-    print(f"Legitimate Send [{tx_1}]: Cyber={res1['cyber_verdict']['reason']} | Physical={res1['physical_verdict']['reason']} => Verdict={res1['decision']['verdict']}")
+def _wait_until_quiet(client, register, quiet=2.5, timeout=20.0):
+    """
+    Wait until the register has not changed for `quiet` seconds, i.e. nobody
+    (including the legitimate operator) has moved it recently. The physical
+    rate-of-change check measures time since the register last settled, so a
+    stealthy attacker only steps a register that has been still for a while.
+    """
+    deadline = time.time() + timeout
+    last = read_plant(client).get(register)
+    still_since = time.time()
+    while time.time() < deadline:
+        time.sleep(0.25)
+        now_val = read_plant(client).get(register)
+        if now_val != last:
+            last, still_since = now_val, time.time()
+        elif time.time() - still_since >= quiet:
+            return
 
-    time.sleep(0.1)
 
-    # 2. Replay Identical Payload within 2 second window
-    tx_2 = f"ATK-RPLY-REUSE-{int(time.time())}"
-    cmd2 = make_command(tx_id=tx_2, timestamp=time.time(), source_ip=source_ip, function_code=6, register=reg, value=val)
-    res2 = send_through_middleware(cmd2)
-    print(f"Replay Send [{tx_2}]: Cyber={res2['cyber_verdict']['reason']} | Physical={res2['physical_verdict']['reason']} => Verdict={res2['decision']['verdict']}")
+def _ramp(client, register, goal, step, wait, max_blocked=3):
+    """
+    Walk one register to `goal` in small signed steps, each within bounds
+    and within the physical rate-of-change limit. Returns True if the goal
+    was reached, False if the middleware kept refusing the next step.
+    """
+    name = _NAME[register]
+    blocked = 0
 
-    return res1, res2
+    while True:
+        current = read_plant(client).get(register)
+        if current is None:
+            print("[ATTACKER] Could not read plant state.")
+            return False
+
+        if abs(current - goal) < 0.5:
+            return True
+
+        _wait_until_quiet(client, register)
+        current = read_plant(client).get(register, current)
+        if abs(current - goal) < 0.5:
+            return True
+
+        delta = max(-step, min(step, goal - current))
+        target = round(current + delta, 1)
+
+        print(f"[ATTACK]   {name}: {current:.1f} -> {target:.1f}")
+        write_signed(client, register, target)
+        time.sleep(wait)
+
+        after = read_plant(client).get(register, current)
+
+        # No progress at all toward the step target -> the middleware
+        # dropped it. (Partial progress means the legitimate SCADA
+        # operator issued its own setpoint meanwhile; just continue.)
+        progress = (after - current) / (target - current) if target != current else 1.0
+        if progress < 0.3:
+            blocked += 1
+            print(f"[ATTACK]   {name} step NOT applied (middleware blocked it) [{blocked}/{max_blocked}]")
+            if blocked >= max_blocked:
+                return False
+
+
+def cross_register_attack():
+
+    print("\n[ATTACK] CROSS-REGISTER CORRELATION (low and slow)")
+    print("[ATTACK] Goal: heater >= 110 C with cooling valve <= 25 deg (thermal runaway).")
+    print("[ATTACK] Every single command stays inside its own safe range and ramp rate.")
+
+    client = connect(
+        MIDDLEWARE_HOST,
+        MIDDLEWARE_PORT
+    )
+
+    if client is None:
+        return
+
+    try:
+
+        print("[ATTACK] Stage 1: close the cooling valve (safe on its own - heater is low)")
+        _ramp(client, COOLING_VALVE, goal=15.0, step=10.0, wait=3.0)
+
+        print("[ATTACK] Stage 2: raise the heater setpoint (each step safe on its own)")
+        reached = _ramp(client, HEATER_TEMP, goal=118.0, step=10.0, wait=3.0)
+
+        if reached:
+            print("[ATTACK] Heater reached goal - combined unsafe state was NOT prevented!")
+        else:
+            print("[ATTACK] Middleware refused the step that completes the unsafe combination.")
+
+    finally:
+
+        client.close()
+
+    print("[ATTACK] Cross-register attack complete.")
+
+
+# ---------------------------------------------------------
+# ATTACK 6..9 — HMAC
+# ---------------------------------------------------------
+
+def hmac_missing_attack():
+
+    print("\n[ATTACK] HMAC MISSING (unsigned command)")
+
+    client = connect(MIDDLEWARE_HOST, MIDDLEWARE_PORT)
+    if client is None:
+        return
+
+    try:
+        current = read_plant(client).get(COOLING_VALVE, 45.0)
+        # A perfectly safe value - the only problem is that it is unsigned.
+        write_register(client, COOLING_VALVE, round(current + 1.0, 1))
+    finally:
+        client.close()
+
+    print("[ATTACK] HMAC missing complete.")
+
+
+def hmac_tamper_attack():
+
+    print("\n[ATTACK] HMAC TAMPER (man-in-the-middle value change)")
+
+    client = connect(MIDDLEWARE_HOST, MIDDLEWARE_PORT)
+    if client is None:
+        return
+
+    try:
+        current = read_plant(client).get(HEATER_TEMP, 60.0)
+        frame = hmac_auth.build_frame(HEATER_TEMP, round(current + 1.0, 1))
+
+        # Intercepted in transit: change the value, keep the original tag.
+        frame[2] = to_raw(140.0)
+
+        send_frame(client, frame, "tampered HEATER_TEMP=140.0 (original tag)")
+    finally:
+        client.close()
+
+    print("[ATTACK] HMAC tamper complete.")
+
+
+def hmac_forged_attack():
+
+    print("\n[ATTACK] HMAC FORGED (attacker guesses the key)")
+
+    client = connect(MIDDLEWARE_HOST, MIDDLEWARE_PORT)
+    if client is None:
+        return
+
+    try:
+        wrong_key = secrets.token_hex(32).encode()
+        current = read_plant(client).get(COOLING_VALVE, 45.0)
+        write_signed(client, COOLING_VALVE, round(current + 1.0, 1), key=wrong_key)
+    finally:
+        client.close()
+
+    print("[ATTACK] HMAC forged complete.")
+
+
+def delayed_replay_attack():
+
+    print("\n[ATTACK] DELAYED REPLAY (valid signature, captured 5 minutes ago)")
+
+    client = connect(MIDDLEWARE_HOST, MIDDLEWARE_PORT)
+    if client is None:
+        return
+
+    try:
+        current = read_plant(client).get(CONVEYOR_SPEED, 0.0)
+        old_ts = int((time.time() - 300) * 1000)
+        write_signed(client, CONVEYOR_SPEED, round(current + 1.0, 1), timestamp_ms=old_ts)
+    finally:
+        client.close()
+
+    print("[ATTACK] Delayed replay complete.")
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+
+ATTACKS = {
+    "flood": flood_attack,
+    "impossible-command": impossible_command_attack,
+    "replay": replay_attack,
+    "false-injection": false_injection_attack,
+    "cross-register": cross_register_attack,
+    "hmac-missing": hmac_missing_attack,
+    "hmac-tamper": hmac_tamper_attack,
+    "hmac-forged": hmac_forged_attack,
+    "delayed-replay": delayed_replay_attack,
+}
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 attacker/attacker.py [flood | false-injection | impossible-command | replay]")
-        sys.exit(1)
 
-    mode = sys.argv[1].lower()
+    global _SOURCE_IP, MIDDLEWARE_HOST, MIDDLEWARE_PORT, PLC_HOST, PLC_PORT
 
-    if mode == "flood":
-        attack_flood()
-    elif mode == "false-injection":
-        attack_false_injection()
-    elif mode == "impossible-command":
-        attack_impossible_command()
-    elif mode == "replay":
-        attack_replay()
-    else:
-        print(f"Unknown attack mode: {mode}")
-        print("Available modes: flood, false-injection, impossible-command, replay")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Industrial Mind attack client")
+    parser.add_argument("attack", nargs="?", choices=sorted(ATTACKS))
+    parser.add_argument(
+        "--source-ip",
+        default="",
+        help="Local IP(s) to attack from, comma-separated (e.g. 127.0.0.2,127.0.0.3). "
+             "Default: OS-chosen address.",
+    )
+    parser.add_argument("--host", default=MIDDLEWARE_HOST, help="Middleware host")
+    parser.add_argument("--port", type=int, default=MIDDLEWARE_PORT, help="Middleware port")
+    parser.add_argument("--plc-host", default=PLC_HOST)
+    parser.add_argument("--plc-port", type=int, default=PLC_PORT)
+
+    args = parser.parse_args()
+
+    if not args.attack:
+        parser.print_help()
+        return
+
+    MIDDLEWARE_HOST, MIDDLEWARE_PORT = args.host, args.port
+    PLC_HOST, PLC_PORT = args.plc_host, args.plc_port
+
+    sources = [s.strip() for s in args.source_ip.split(",") if s.strip()] or [None]
+
+    for src in sources:
+        _SOURCE_IP = src
+        ATTACKS[args.attack]()
+        if len(sources) > 1:
+            time.sleep(1.2)   # keep per-source bursts separate
 
 
 if __name__ == "__main__":
+
     main()

@@ -14,7 +14,7 @@ ModbusSequentialDataBlock.setValues) only works on the pre-3.13 API. Don't
 import time
 import threading
 
-from docs.interfaces import TANK_PRESSURE, CONVEYOR_SPEED, COOLING_VALVE, REGISTER_MAP
+from docs.interfaces import MACHINES, NUM_REGISTERS, REGISTER_MAP, SCALE
 
 from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext, ModbusSequentialDataBlock
 from pymodbus.server import StartTcpServer
@@ -23,20 +23,13 @@ from pymodbus.server import StartTcpServer
 
 _state_lock = threading.Lock()
 
-_current_values = {
-    TANK_PRESSURE: 50.0,   # start mid-range so it can move either direction
-    CONVEYOR_SPEED: 0.0,
-    COOLING_VALVE: 45.0,
-}
+# One entry per machine in docs/interfaces.MACHINES (centralized config).
+_current_values = {m["register"]: float(m["initial"]) for m in MACHINES}
 
 _target_values = dict(_current_values)  # targets start equal to current
 
 # How fast each register can physically move per second (tune these)
-_RATE_PER_SEC = {
-    TANK_PRESSURE: 2.0,    # PSI/sec
-    CONVEYOR_SPEED: 10.0,  # RPM/sec
-    COOLING_VALVE: 5.0,    # deg/sec
-}
+_RATE_PER_SEC = {m["register"]: float(m["rate_per_sec"]) for m in MACHINES}
 
 _recent_writes = []   # timestamps of recent writes, for the CPU-load metric
 _cpu_baseline = 5.0
@@ -46,7 +39,7 @@ _cpu_current = _cpu_baseline
 # We keep one decimal place of precision by scaling floats by this factor
 # before writing, and dividing by it after reading. Agreed with Abhiram so
 # middleware_server.py decodes the same way.
-_SCALE = 10
+_SCALE = SCALE
 
 
 def notify_upstream_response(register: int, value: float):
@@ -170,8 +163,8 @@ def internal_sync_write(block: ModbusSequentialDataBlock, address: int, values: 
 
 
 def start_modbus_server(host: str = "0.0.0.0", port: int = 5020):
-    """Starts the Modbus TCP server exposing the 3 registers."""
-    block = SyncedDataBlock(0, [0] * 3)  # base address 0 -> valid addrs 0,1,2
+    """Starts the Modbus TCP server exposing one register per configured machine."""
+    block = SyncedDataBlock(0, [0] * NUM_REGISTERS)  # base address 0 -> valid addrs 0..N-1
     store = ModbusSlaveContext(hr=block, zero_mode=True)
     context = ModbusServerContext(slaves=store, single=True)
 
