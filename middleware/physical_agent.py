@@ -10,7 +10,12 @@ Downstream (SCADA -> PLC):
                             the command timestamp.
     3. Cross-register     — certain combinations of simultaneous requested moves
                             are physically impossible (e.g. valve slamming shut
-                            while pressure is already low).
+                            while pressure is already low), plus the
+                            config-driven correlation rules in
+                            docs/interfaces.CROSS_REGISTER_RULES: each command
+                            may be safe on its own, but the COMBINED projected
+                            plant state across several machines is unsafe
+                            -> CROSS_REGISTER_VIOLATION.
 
 Upstream (PLC -> SCADA):
   check_feedback(commanded_value, reported_value, register) -> verdict
@@ -20,10 +25,12 @@ Upstream (PLC -> SCADA):
 current_state contract (passed in by the caller — middleware or test harness):
   {
       "registers": {
-          0: <float>,   # TANK_PRESSURE current value
-          1: <float>,   # CONVEYOR_SPEED current value
-          2: <float>,   # COOLING_VALVE current value
+          <register>: <float>,   # current PLC value, one entry per machine
+          ...                    # (see docs/interfaces.MACHINES)
       },
+      "setpoints": {             # OPTIONAL - latest approved target per register
+          <register>: <float>,   # (pending setpoints the PLC is still ramping to).
+      },                         # Falls back to "registers" when absent.
       "timestamp": <float>   # time.time() when telemetry was captured
   }
   Alternatively, register keys may be the string names — both are tolerated
@@ -34,6 +41,9 @@ import time
 from docs.interfaces import (
     make_verdict,
     REGISTER_MAP,
+    MACHINES,
+    MACHINE_BY_REGISTER,
+    CROSS_REGISTER_RULES,
     TANK_PRESSURE,
     CONVEYOR_SPEED,
     COOLING_VALVE,
@@ -43,10 +53,9 @@ from docs.interfaces import (
 # Mirror the PLC's _RATE_PER_SEC so we know what's physically achievable.
 # The Physical Agent gives 10 % headroom on top so marginal-but-legitimate
 # commands aren't falsely dropped.
+_RATE_HEADROOM = 1.10
 _RATE_LIMIT_PER_SEC = {
-    TANK_PRESSURE:  2.0 * 1.10,   # PSI / sec  (+10 % headroom)
-    CONVEYOR_SPEED: 10.0 * 1.10,  # RPM / sec
-    COOLING_VALVE:  5.0 * 1.10,   # deg / sec
+    m["register"]: m["rate_per_sec"] * _RATE_HEADROOM for m in MACHINES
 }
 
 # Minimum time window used for rate calculations (avoids division by zero and
@@ -61,11 +70,7 @@ _FEEDBACK_TOLERANCE_FRACTION = 0.20   # 20 % of the register's safe range
 
 # ── Cross-register consistency thresholds ──────────────────────────────────
 # How much a value must change (absolute) to count as a "significant move".
-_SIG_MOVE = {
-    TANK_PRESSURE:  10.0,   # PSI
-    CONVEYOR_SPEED: 20.0,   # RPM
-    COOLING_VALVE:  15.0,   # degrees
-}
+_SIG_MOVE = {m["register"]: m["sig_move"] for m in MACHINES}
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -167,7 +172,7 @@ def _check_cross_register(tx_id: str, command: dict, current_state: dict):
         if valve_drop >= _SIG_MOVE[COOLING_VALVE] and tank_pressure < pressure_threshold:
             return make_verdict(
                 tx_id, False,
-                "CROSS_REGISTER:valve closing sharply with tank pressure already low",
+                "CROSS_REGISTER_VIOLATION:VALVE_CLOSING_LOW_PRESSURE:valve closing sharply with tank pressure already low",
                 "physical",
             )
 
@@ -181,9 +186,85 @@ def _check_cross_register(tx_id: str, command: dict, current_state: dict):
         if pressure_near_max and speed_near_max:
             return make_verdict(
                 tx_id, False,
-                "CROSS_REGISTER:conveyor near max speed while tank pressure near limit",
+                "CROSS_REGISTER_VIOLATION:CONVEYOR_PRESSURE_OVERLOAD:conveyor near max speed while tank pressure near limit",
                 "physical",
             )
+
+    # Rules C..: config-driven multi-machine correlation rules
+    return _check_correlation_rules(tx_id, command, current_state)
+
+
+_OPS = {
+    ">=": lambda v, t: v >= t,
+    "<=": lambda v, t: v <= t,
+}
+
+
+def _baseline_setpoints(current_state: dict) -> dict:
+    """Plant state the command will be combined with: approved setpoints the
+    PLC is heading to (if the caller supplies them), else live telemetry."""
+    base = {}
+    setpoints = current_state.get("setpoints") or {}
+    for m in MACHINES:
+        reg = m["register"]
+        val = setpoints.get(reg, setpoints.get(m["name"]))
+        if val is None:
+            val = _get_value(current_state, reg)
+        if val is not None:
+            base[reg] = float(val)
+    return base
+
+
+def _rule_holds(rule, state):
+    for reg, op, threshold in rule["conditions"]:
+        if reg not in state or not _OPS[op](state[reg], threshold):
+            return False
+    return True
+
+
+def _moves_toward_safety(rule, register, old, new):
+    for reg, op, _ in rule["conditions"]:
+        if reg == register:
+            return (op == ">=" and new < old) or (op == "<=" and new > old)
+    return False
+
+
+def _check_correlation_rules(tx_id: str, command: dict, current_state: dict):
+    """
+    Cross-register correlation: apply the requested value to the projected
+    plant state and evaluate every rule that involves the commanded register.
+    Each command can be individually inside bounds and rate limits, yet the
+    combination across machines is unsafe.
+
+    A command that moves an ALREADY-violating state towards safety is allowed,
+    so operators can always recover the plant.
+    """
+    register = command.get("register")
+    value = float(command.get("value"))
+
+    baseline = _baseline_setpoints(current_state)
+    projected = dict(baseline)
+    projected[register] = value
+
+    for rule in CROSS_REGISTER_RULES:
+        involved = {reg for reg, _, _ in rule["conditions"]}
+        if register not in involved:
+            continue
+        if not _rule_holds(rule, projected):
+            continue
+        if _rule_holds(rule, baseline) and register in baseline and \
+                _moves_toward_safety(rule, register, baseline[register], value):
+            continue
+
+        detail = " & ".join(
+            f"{MACHINE_BY_REGISTER[reg]['name']}={projected[reg]:.1f}{op}{threshold:g}"
+            for reg, op, threshold in rule["conditions"]
+        )
+        return make_verdict(
+            tx_id, False,
+            f"CROSS_REGISTER_VIOLATION:{rule['id']}:{detail} ({rule['description']})",
+            "physical",
+        )
 
     return None
 
@@ -242,7 +323,7 @@ def check_feedback(commanded_value: float, reported_value: float, register: int)
     Args:
         commanded_value: The last value sent to this register by the middleware.
         reported_value:  The value the PLC is currently reporting.
-        register:        Register number (0, 1, or 2).
+        register:        Register number (see docs/interfaces.MACHINES).
 
     Returns:
         Verdict dict with agent="physical".

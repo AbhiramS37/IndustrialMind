@@ -228,67 +228,41 @@ function updateTelemetry(telemetry) {
     const registers =
         telemetry.registers || {};
 
-    // -----------------------------
-    // Tank Pressure
-    // -----------------------------
+    // One row per machine from the central config
+    // (docs/interfaces.MACHINES, injected by the template).
 
-    const pressure =
-        Number(
-            registers.TANK_PRESSURE ?? 0
+    (window.IM_MACHINES || []).forEach(machine => {
+
+        const value =
+            Number(
+                registers[machine.name] ?? 0
+            );
+
+        setText(
+            `val-${machine.name}`,
+            `${value.toFixed(1)}${unitSuffix(machine.unit)}`
         );
 
-    setText(
-        "val-pressure",
-        `${pressure.toFixed(1)} PSI`
-    );
-
-    setBar(
-        "bar-pressure",
-        pressure,
-        100
-    );
-
-
-    // -----------------------------
-    // Conveyor Speed
-    // -----------------------------
-
-    const speed =
-        Number(
-            registers.CONVEYOR_SPEED ?? 0
+        setBar(
+            `bar-${machine.name}`,
+            value - machine.min,
+            machine.max - machine.min
         );
-
-    setText(
-        "val-speed",
-        `${speed.toFixed(1)} RPM`
-    );
-
-    setBar(
-        "bar-speed",
-        speed,
-        120
-    );
+    });
+}
 
 
-    // -----------------------------
-    // Cooling Valve
-    // -----------------------------
+function unitSuffix(unit) {
 
-    const valve =
-        Number(
-            registers.COOLING_VALVE ?? 0
-        );
+    if (unit === "deg") {
+        return "°";
+    }
 
-    setText(
-        "val-valve",
-        `${valve.toFixed(1)}°`
-    );
+    if (unit === "C") {
+        return "°C";
+    }
 
-    setBar(
-        "bar-valve",
-        valve,
-        90
-    );
+    return unit ? ` ${unit}` : "";
 }
 
 
@@ -622,7 +596,9 @@ async function triggerAttack(attack) {
                     },
 
                     body: JSON.stringify({
-                        attack: attack
+                        attack: attack,
+                        source_ip:
+                            (document.getElementById("attack-source-ip")?.value || "").trim()
                     })
                 }
             );
@@ -744,6 +720,418 @@ function setupButtons() {
 
 
 // =========================================================
+// BLOCKED IPS / BLOCKED SOURCES
+// Real data from logs/blocked_attacks.jsonl via /api/blocked-ips
+// =========================================================
+
+let selectedBlockedIp = null;
+let selectedAttackKey = null;
+let blockedDetailRecords = [];
+
+
+function blockedFilters() {
+
+    return {
+        attackType:
+            document.getElementById("filter-attack-type")?.value || "",
+        ip:
+            (document.getElementById("filter-ip")?.value || "").trim()
+    };
+}
+
+
+async function refreshBlockedIps() {
+
+    const { attackType, ip } = blockedFilters();
+
+    const params = new URLSearchParams();
+
+    if (attackType) {
+        params.set("attack_type", attackType);
+    }
+
+    if (ip) {
+        params.set("ip", ip);
+    }
+
+    try {
+
+        const response = await fetch(
+            `/api/blocked-ips?${params.toString()}`,
+            { cache: "no-store" }
+        );
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        updateAttackTypeOptions(data.attack_types || {});
+
+        renderBlockedIps(data.sources || []);
+
+        setText(
+            "blocked-count",
+            `${(data.sources || []).length} sources · ` +
+            `${data.matching_records ?? 0} blocked attacks` +
+            (data.matching_records !== data.total_records
+                ? ` (of ${data.total_records})`
+                : "")
+        );
+
+        setText(
+            "blocked-log-info",
+            data.log_file || "logs/blocked_attacks.jsonl"
+        );
+
+        if (selectedBlockedIp) {
+            await loadBlockedDetail(selectedBlockedIp, false);
+        }
+
+    } catch (error) {
+
+        console.error("Blocked IP update failed:", error);
+    }
+}
+
+
+function updateAttackTypeOptions(counts) {
+
+    const select =
+        document.getElementById("filter-attack-type");
+
+    if (!select) {
+        return;
+    }
+
+    const current = select.value;
+
+    const types = Object.keys(counts);
+
+    if (current && !types.includes(current)) {
+        types.push(current);
+    }
+
+    const signature = JSON.stringify(
+        types.map(t => [t, counts[t] ?? 0])
+    );
+
+    if (select.dataset.signature === signature) {
+        return;
+    }
+
+    select.dataset.signature = signature;
+
+    select.innerHTML =
+        `<option value="">All Attack Types</option>` +
+        types.sort().map(t =>
+            `<option value="${safe(t)}">${safe(t)} (${counts[t] ?? 0})</option>`
+        ).join("");
+
+    select.value = current;
+}
+
+
+function renderBlockedIps(sources) {
+
+    const tbody =
+        document.getElementById("tbody-blocked-ips");
+
+    if (!tbody) {
+        return;
+    }
+
+    tbody.innerHTML = "";
+
+    if (!sources.length) {
+
+        tbody.innerHTML =
+            `<tr><td colspan="7" class="empty-row">No blocked sources match the current filters.</td></tr>`;
+
+        return;
+    }
+
+    sources.forEach(source => {
+
+        const row = document.createElement("tr");
+
+        row.className =
+            "clickable-row" +
+            (source.source_ip === selectedBlockedIp ? " selected-row" : "");
+
+        const types =
+            Object.entries(source.attack_types || {})
+                .map(([t, n]) => `${safe(t)} ×${n}`)
+                .join("<br>");
+
+        row.innerHTML = `
+            <td><span class="transaction-id ip-link">${safe(source.source_ip)}</span></td>
+            <td><span class="verdict drop">${safe(source.attack_count)}</span></td>
+            <td>${types || "—"}</td>
+            <td>${safe(source.latest_attack_type)}</td>
+            <td>${safe(source.latest_machine)}</td>
+            <td class="reason-cell">${safe(source.latest_reason)}</td>
+            <td>${safe(formatDateTime(source.last_seen))}</td>
+        `;
+
+        row.addEventListener(
+            "click",
+            () => loadBlockedDetail(source.source_ip, true)
+        );
+
+        tbody.appendChild(row);
+    });
+}
+
+
+async function loadBlockedDetail(ip, userClick) {
+
+    if (userClick) {
+
+        selectedBlockedIp = ip;
+        selectedAttackKey = null;
+
+        document
+            .querySelectorAll("#tbody-blocked-ips tr")
+            .forEach(tr => tr.classList.toggle(
+                "selected-row",
+                tr.querySelector(".ip-link")?.textContent === ip
+            ));
+    }
+
+    const { attackType } = blockedFilters();
+
+    const params = new URLSearchParams();
+
+    if (attackType) {
+        params.set("attack_type", attackType);
+    }
+
+    try {
+
+        const response = await fetch(
+            `/api/blocked-ips/${encodeURIComponent(ip)}?${params.toString()}`,
+            { cache: "no-store" }
+        );
+
+        const data = await response.json();
+
+        blockedDetailRecords = data.attacks || [];
+
+        const panel = document.getElementById("blocked-detail");
+
+        if (panel) {
+            panel.style.display = "block";
+        }
+
+        setText(
+            "blocked-detail-title",
+            `${ip} · ${data.count} blocked attack${data.count === 1 ? "" : "s"}` +
+            (attackType ? ` · ${attackType}` : "")
+        );
+
+        renderBlockedDetail(blockedDetailRecords);
+
+        if (userClick && blockedDetailRecords.length) {
+            showAttackRecord(blockedDetailRecords[0]);
+        } else if (selectedAttackKey) {
+            const rec = blockedDetailRecords.find(r => attackKey(r) === selectedAttackKey);
+            if (rec) {
+                showAttackRecord(rec);
+            }
+        }
+
+        if (userClick && panel) {
+            panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+
+    } catch (error) {
+
+        console.error("Blocked IP detail failed:", error);
+    }
+}
+
+
+function attackKey(record) {
+
+    return `${record.tx_id}|${record.timestamp}`;
+}
+
+
+function renderBlockedDetail(records) {
+
+    const tbody =
+        document.getElementById("tbody-blocked-detail");
+
+    if (!tbody) {
+        return;
+    }
+
+    tbody.innerHTML = "";
+
+    if (!records.length) {
+
+        tbody.innerHTML =
+            `<tr><td colspan="10" class="empty-row">No attacks for this source match the selected attack type.</td></tr>`;
+
+        return;
+    }
+
+    records.forEach(record => {
+
+        const row = document.createElement("tr");
+
+        row.className =
+            "clickable-row" +
+            (attackKey(record) === selectedAttackKey ? " selected-row" : "");
+
+        row.innerHTML = `
+            <td>${safe(formatDateTime(record.timestamp))}</td>
+            <td><span class="transaction-id">${safe(String(record.tx_id || "").slice(0, 8))}</span></td>
+            <td>${safe(record.attack_type)}</td>
+            <td>${safe(record.machine)}<br><span class="muted">${safe(record.register_name)} (reg ${safe(record.register)})</span></td>
+            <td>${formatValue(record.requested_value, record.unit)}</td>
+            <td>${formatValue(record.current_value, record.unit)}</td>
+            <td><span class="verdict ${record.cyber?.verdict === "PASS" ? "pass" : "drop"}">${safe(record.cyber?.verdict)}</span></td>
+            <td><span class="verdict ${record.physical?.verdict === "PASS" ? "pass" : "drop"}">${safe(record.physical?.verdict)}</span></td>
+            <td><span class="verdict drop">${safe(record.orchestrator?.decision)}</span></td>
+            <td>${formatLatency(record.latency_ms)}</td>
+        `;
+
+        row.addEventListener(
+            "click",
+            () => showAttackRecord(record)
+        );
+
+        tbody.appendChild(row);
+    });
+}
+
+
+function showAttackRecord(record) {
+
+    selectedAttackKey = attackKey(record);
+
+    document
+        .querySelectorAll("#tbody-blocked-detail tr")
+        .forEach((tr, i) => tr.classList.toggle(
+            "selected-row",
+            blockedDetailRecords[i] && attackKey(blockedDetailRecords[i]) === selectedAttackKey
+        ));
+
+    const box = document.getElementById("attack-record");
+
+    if (!box) {
+        return;
+    }
+
+    const fields = [
+        ["Time", record.time],
+        ["Source IP", record.source_ip],
+        ["Source port", record.source_port],
+        ["Attack type", record.attack_type],
+        ["Reason code", record.reason_code],
+        ["Transaction ID", record.tx_id],
+        ["Direction", record.direction],
+        ["Modbus function code", record.function_code],
+        ["Machine", record.machine],
+        ["Register", `${record.register_name} (address ${record.register})`],
+        ["Requested value", formatValue(record.requested_value, record.unit, true)],
+        ["Current value", formatValue(record.current_value, record.unit, true)],
+        ["HMAC signature", record.signature],
+        ["HMAC status", record.hmac_status],
+        ["Cyber Agent", `${record.cyber?.verdict} — ${record.cyber?.reason}`],
+        ["Physical Agent", `${record.physical?.verdict} — ${record.physical?.reason}`],
+        ["Orchestrator", `${record.orchestrator?.decision} — ${record.orchestrator?.reason}`],
+        ["Latency", formatLatency(record.latency_ms)],
+    ];
+
+    box.innerHTML =
+        `<div class="attack-record-grid">` +
+        fields.map(([k, v]) =>
+            `<span class="attack-record-key">${safe(k)}</span>` +
+            `<span class="attack-record-val">${safe(v)}</span>`
+        ).join("") +
+        `</div>`;
+
+    box.style.display = "block";
+}
+
+
+function closeBlockedDetail() {
+
+    selectedBlockedIp = null;
+    selectedAttackKey = null;
+
+    const panel = document.getElementById("blocked-detail");
+
+    if (panel) {
+        panel.style.display = "none";
+    }
+
+    document
+        .querySelectorAll("#tbody-blocked-ips tr")
+        .forEach(tr => tr.classList.remove("selected-row"));
+}
+
+
+function formatDateTime(ts) {
+
+    const n = Number(ts);
+
+    if (!ts || Number.isNaN(n)) {
+        return "";
+    }
+
+    const d = new Date(n * 1000);
+
+    return d.toLocaleDateString() + " " + d.toLocaleTimeString();
+}
+
+
+function formatValue(value, unit, plain) {
+
+    if (value === null || value === undefined || value === "") {
+        return plain ? "—" : "—";
+    }
+
+    const n = Number(value);
+
+    const text = Number.isNaN(n)
+        ? String(value)
+        : `${n.toFixed(2)}${unitSuffix(unit)}`;
+
+    return plain ? text : safe(text);
+}
+
+
+function setupBlockedSection() {
+
+    const select = document.getElementById("filter-attack-type");
+    const input = document.getElementById("filter-ip");
+    const close = document.getElementById("btn-close-detail");
+
+    let debounce = null;
+
+    if (select) {
+        select.addEventListener("change", refreshBlockedIps);
+    }
+
+    if (input) {
+        input.addEventListener("input", () => {
+            clearTimeout(debounce);
+            debounce = setTimeout(refreshBlockedIps, 250);
+        });
+    }
+
+    if (close) {
+        close.addEventListener("click", closeBlockedDetail);
+    }
+}
+
+
+// =========================================================
 // START
 // =========================================================
 
@@ -753,11 +1141,20 @@ document.addEventListener(
 
         setupButtons();
 
+        setupBlockedSection();
+
         refreshDashboard();
+
+        refreshBlockedIps();
 
         setInterval(
             refreshDashboard,
             1000
+        );
+
+        setInterval(
+            refreshBlockedIps,
+            3000
         );
     }
 );

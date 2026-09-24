@@ -116,6 +116,30 @@
                     False Injection
                 </button>
 
+                <button class="btn btn-danger" onclick="triggerAttack('cross-register')">
+                    Cross-Register
+                </button>
+
+                <button class="btn btn-danger" onclick="triggerAttack('hmac-missing')">
+                    HMAC Missing
+                </button>
+
+                <button class="btn btn-danger" onclick="triggerAttack('hmac-tamper')">
+                    HMAC Tamper
+                </button>
+
+                <button class="btn btn-danger" onclick="triggerAttack('hmac-forged')">
+                    HMAC Forged
+                </button>
+
+                <button class="btn btn-danger" onclick="triggerAttack('delayed-replay')">
+                    Delayed Replay
+                </button>
+
+                <input id="attack-source-ip" class="filter-input" type="text"
+                    placeholder="Attack from source IP (optional, e.g. 127.0.0.2)"
+                    title="Local address the attacker socket binds to. The middleware records the real connection address.">
+
             </div>
 
         </section>
@@ -305,17 +329,19 @@
 
                 <div class="telemetry-list">
 
+                    {% for m in machines %}
+                    {% set u = '°' if m.unit == 'deg' else ('°C' if m.unit == 'C' else ' ' ~ m.unit) %}
 
                     <div class="telemetry-item">
 
                         <div class="telemetry-header">
 
                             <span>
-                                Tank Pressure
+                                {{ m.label }}
                             </span>
 
-                            <span class="telemetry-val" id="val-pressure">
-                                50 PSI
+                            <span class="telemetry-val" id="val-{{ m.name }}">
+                                {{ m.initial }}{{ u }}
                             </span>
 
                         </div>
@@ -323,77 +349,18 @@
 
                         <div class="progress-bar">
 
-                            <div class="progress-fill" id="bar-pressure" style="width:50%;"></div>
+                            <div class="progress-fill {{ m.bar_class }}" id="bar-{{ m.name }}" style="width:{{ (m.initial - m.min) / (m.max - m.min) * 100 }}%;"></div>
 
                         </div>
 
 
                         <span class="range-info">
-                            Safe range: 0 – 100 PSI
+                            {{ m.machine }} · Safe range: {{ m.min }} – {{ m.max }}{{ u }}
                         </span>
 
                     </div>
 
-
-
-                    <div class="telemetry-item">
-
-                        <div class="telemetry-header">
-
-                            <span>
-                                Conveyor Speed
-                            </span>
-
-                            <span class="telemetry-val" id="val-speed">
-                                0 RPM
-                            </span>
-
-                        </div>
-
-
-                        <div class="progress-bar">
-
-                            <div class="progress-fill warning" id="bar-speed" style="width:0%;"></div>
-
-                        </div>
-
-
-                        <span class="range-info">
-                            Safe range: 0 – 120 RPM
-                        </span>
-
-                    </div>
-
-
-
-                    <div class="telemetry-item">
-
-                        <div class="telemetry-header">
-
-                            <span>
-                                Cooling Valve
-                            </span>
-
-                            <span class="telemetry-val" id="val-valve">
-                                45°
-                            </span>
-
-                        </div>
-
-
-                        <div class="progress-bar">
-
-                            <div class="progress-fill info" id="bar-valve" style="width:50%;"></div>
-
-                        </div>
-
-
-                        <span class="range-info">
-                            Safe range: 0 – 90°
-                        </span>
-
-                    </div>
-
+                    {% endfor %}
 
                 </div>
 
@@ -435,8 +402,130 @@
         </div>
 
 
+        <!-- BLOCKED IPS / BLOCKED SOURCES (from logs/blocked_attacks.jsonl) -->
+
+        <section class="card blocked-card" id="blocked-section">
+
+            <div class="card-header">
+
+                <h2>
+                    <i class="fa-solid fa-ban title-icon"></i>
+                    Blocked IPs / Blocked Sources
+                </h2>
+
+                <span class="badge-tag" id="blocked-log-info">
+                    logs/blocked_attacks.jsonl
+                </span>
+
+            </div>
+
+
+            <div class="blocked-filters">
+
+                <select id="filter-attack-type" class="filter-input">
+                    <option value="">All Attack Types</option>
+                </select>
+
+                <input id="filter-ip" class="filter-input" type="text" placeholder="Search IP…" autocomplete="off">
+
+                <span class="blocked-count" id="blocked-count">0 sources · 0 blocked attacks</span>
+
+            </div>
+
+
+            <div class="table-wrapper">
+
+                <table class="data-table">
+
+                    <thead>
+
+                        <tr>
+
+                            <th>BLOCKED IP</th>
+                            <th>ATTACKS</th>
+                            <th>ATTACK TYPES</th>
+                            <th>LATEST ATTACK</th>
+                            <th>LATEST MACHINE</th>
+                            <th>LATEST REASON</th>
+                            <th>LAST SEEN</th>
+
+                        </tr>
+
+                    </thead>
+
+
+                    <tbody id="tbody-blocked-ips">
+
+                    </tbody>
+
+                </table>
+
+            </div>
+
+
+            <div class="blocked-detail" id="blocked-detail" style="display:none;">
+
+                <div class="card-header">
+
+                    <h2>
+                        <i class="fa-solid fa-magnifying-glass title-icon"></i>
+                        <span id="blocked-detail-title">Source details</span>
+                    </h2>
+
+                    <button class="btn btn-secondary" id="btn-close-detail">
+                        <i class="fa-solid fa-xmark"></i>
+                        Close
+                    </button>
+
+                </div>
+
+
+                <div class="table-wrapper">
+
+                    <table class="data-table">
+
+                        <thead>
+
+                            <tr>
+
+                                <th>TIME</th>
+                                <th>TRANSACTION ID</th>
+                                <th>ATTACK TYPE</th>
+                                <th>MACHINE / REGISTER</th>
+                                <th>REQUESTED</th>
+                                <th>CURRENT</th>
+                                <th>CYBER</th>
+                                <th>PHYSICAL</th>
+                                <th>DECISION</th>
+                                <th>LATENCY</th>
+
+                            </tr>
+
+                        </thead>
+
+
+                        <tbody id="tbody-blocked-detail">
+
+                        </tbody>
+
+                    </table>
+
+                </div>
+
+
+                <div class="attack-record" id="attack-record" style="display:none;"></div>
+
+            </div>
+
+        </section>
+
+
     </div>
 
+
+    <script>
+        window.IM_MACHINES = {{ machines | tojson }};
+    </script>
 
     <script src="{{ url_for('static', filename='script.js') }}"></script>
 

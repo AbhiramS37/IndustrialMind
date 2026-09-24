@@ -24,8 +24,23 @@ Middleware :5021
 Dashboard:
   LEFT  = every SCADA -> PLC security decision
   RIGHT = only actual PLC confirmations for PASSed commands
+
+Source IP:
+  The source IP of every command is taken from the TCP connection that
+  delivered it (asyncio transport peername), captured per request by
+  SourceTrackingRequestHandler. Nothing the client sends is used as its IP.
+
+Authentication:
+  Trusted commands arrive as HMAC-SHA256 signed frames (FC16 to FRAME_BASE,
+  see docs/hmac_auth.py). Plain writes to machine registers are still run
+  through the pipeline so they are visibly rejected (HMAC_MISSING) and logged.
+
+Blocked attacks:
+  Every DROP is appended to logs/blocked_attacks.jsonl (docs/attack_log.py).
 """
 
+import asyncio
+import contextvars
 import time
 import threading
 import uuid
@@ -37,15 +52,22 @@ from pymodbus.datastore import (
     ModbusSlaveContext,
     ModbusServerContext,
 )
-from pymodbus.server import StartTcpServer
+from pymodbus.server import ModbusTcpServer
+from pymodbus.server.async_io import ModbusServerRequestHandler
 
 from docs.interfaces import (
     make_command,
     REGISTER_MAP,
-    TANK_PRESSURE,
-    CONVEYOR_SPEED,
-    COOLING_VALVE,
+    MACHINES,
+    MACHINE_BY_REGISTER,
+    ALL_REGISTERS,
+    NUM_REGISTERS,
+    FRAME_BASE,
+    FRAME_LEN,
+    DATASTORE_SIZE,
+    SCALE,
 )
+from docs import hmac_auth, attack_log
 
 from middleware import (
     cyber_agent,
@@ -66,8 +88,6 @@ LISTEN_PORT = 5021
 
 DASHBOARD_URL = "http://127.0.0.1:5050"
 
-SCALE = 10
-
 # PLC is checked frequently for real feedback.
 POLL_INTERVAL = 0.2
 
@@ -75,16 +95,62 @@ POLL_INTERVAL = 0.2
 # PLC polling cycle.
 TELEMETRY_REPORT_INTERVAL = 1.0
 
-DEFAULT_SOURCE_IP = "192.168.1.10"
+# Used ONLY when a command is injected without any network connection
+# (e.g. a unit test calling _handle_downstream_write directly). It is not a
+# trusted address, so such commands fail the source whitelist.
+UNKNOWN_SOURCE_IP = "unknown"
 
 FEEDBACK_SETTLED_TOLERANCE = 0.05
 
 
-_ALL_REGISTERS = (
-    TANK_PRESSURE,
-    CONVEYOR_SPEED,
-    COOLING_VALVE,
+_ALL_REGISTERS = ALL_REGISTERS
+
+
+# =========================================================
+# REAL SOURCE IP CAPTURE
+# =========================================================
+
+# Set for the duration of each Modbus request so the datastore hook
+# (MiddlewareDataBlock.setValues) knows which connection sent it.
+_request_ctx: contextvars.ContextVar = contextvars.ContextVar(
+    "im_request_ctx", default=None
 )
+
+
+def _normalize_ip(ip):
+    ip = str(ip or "")
+    if ip.startswith("::ffff:"):
+        ip = ip[7:]
+    return ip
+
+
+class SourceTrackingRequestHandler(ModbusServerRequestHandler):
+    """Per-connection handler that records the real peer address and
+    function code of each request before it touches the datastore."""
+
+    async def _async_execute(self, request, *addr):
+        peer = None
+        try:
+            peer = self.transport.get_extra_info("peername")
+        except Exception:
+            peer = None
+
+        ctx = {
+            "source_ip": _normalize_ip(peer[0]) if peer else UNKNOWN_SOURCE_IP,
+            "source_port": peer[1] if peer and len(peer) > 1 else None,
+            "function_code": getattr(request, "function_code", None),
+        }
+
+        token = _request_ctx.set(ctx)
+        try:
+            await super()._async_execute(request, *addr)
+        finally:
+            _request_ctx.reset(token)
+
+
+class SourceTrackingTcpServer(ModbusTcpServer):
+    def callback_new_connection(self):
+        return SourceTrackingRequestHandler(self)
 
 
 # =========================================================
@@ -95,9 +161,7 @@ _state_lock = threading.Lock()
 
 _plc_state = {
     "registers": {
-        TANK_PRESSURE: 50.0,
-        CONVEYOR_SPEED: 0.0,
-        COOLING_VALVE: 45.0,
+        m["register"]: float(m["initial"]) for m in MACHINES
     },
     "timestamp": time.time(),
 }
@@ -154,19 +218,62 @@ class MiddlewareDataBlock(ModbusSequentialDataBlock):
         # Store the value locally first.
         super().setValues(address, values)
 
-        # Process every affected register.
-        for i, raw_value in enumerate(values):
+        _process_write(
+            address,
+            list(values),
+            _request_ctx.get() or {}
+        )
 
-            register = address + i
 
-            if register in _ALL_REGISTERS:
+def _process_write(address, values, ctx):
+    """
+    Routes one external Modbus write into the security pipeline.
 
-                value = _from_raw(raw_value)
+      FRAME_BASE ........ signed command frame -> verified by Cyber Agent
+      machine registers . plain unsigned write -> HMAC_MISSING
+      anything else ..... probe of an unmapped address -> INVALID_REGISTER
+    """
 
-                _handle_downstream_write(
-                    register,
-                    value
-                )
+    source_ip = ctx.get("source_ip") or UNKNOWN_SOURCE_IP
+    source_port = ctx.get("source_port")
+    function_code = ctx.get("function_code") or (16 if len(values) > 1 else 6)
+
+    if FRAME_BASE <= address < FRAME_BASE + FRAME_LEN:
+
+        if address == FRAME_BASE:
+            parsed = hmac_auth.parse_frame(values)
+        else:
+            parsed = {
+                "register": None,
+                "raw_value": None,
+                "auth": {"malformed": True, "detail": "write did not start at frame base"},
+            }
+
+        register = parsed["register"] if parsed["register"] is not None else address
+        raw_value = parsed["raw_value"]
+
+        _handle_downstream_write(
+            register,
+            _from_raw(raw_value) if raw_value is not None else 0.0,
+            source_ip=source_ip,
+            source_port=source_port,
+            function_code=function_code,
+            raw_value=raw_value,
+            auth=parsed["auth"],
+        )
+        return
+
+    for i, raw_value in enumerate(values):
+
+        _handle_downstream_write(
+            address + i,
+            _from_raw(raw_value),
+            source_ip=source_ip,
+            source_port=source_port,
+            function_code=function_code,
+            raw_value=raw_value,
+            auth=None,
+        )
 
 
 # =========================================================
@@ -175,14 +282,26 @@ class MiddlewareDataBlock(ModbusSequentialDataBlock):
 
 def _handle_downstream_write(
     register: int,
-    value: float
+    value: float,
+    source_ip: str | None = None,
+    source_port: int | None = None,
+    function_code: int = 6,
+    raw_value: int | None = None,
+    auth: dict | None = None,
 ):
 
     start_time = time.time()
 
     tx_id = str(uuid.uuid4())
 
-    register_name = REGISTER_MAP[register]["name"]
+    if source_ip is None:
+        ctx = _request_ctx.get() or {}
+        source_ip = ctx.get("source_ip") or UNKNOWN_SOURCE_IP
+        source_port = source_port or ctx.get("source_port")
+
+    register_name = REGISTER_MAP.get(
+        register, {}
+    ).get("name", f"REGISTER_{register}")
 
     # -----------------------------------------------------
     # Build command
@@ -191,10 +310,13 @@ def _handle_downstream_write(
     command = make_command(
         tx_id=tx_id,
         timestamp=start_time,
-        source_ip=DEFAULT_SOURCE_IP,
-        function_code=6,
+        source_ip=source_ip,
+        function_code=function_code,
         register=register,
         value=value,
+        raw_value=raw_value,
+        auth=auth,
+        source_port=source_port,
     )
 
     # -----------------------------------------------------
@@ -211,14 +333,25 @@ def _handle_downstream_write(
 
     with _state_lock:
 
-        current_state = {
-            "registers": dict(
-                _plc_state["registers"]
-            ),
+        registers_now = dict(
+            _plc_state["registers"]
+        )
 
-            "timestamp": _register_settled_since[
-                register
-            ],
+        # Projected plant state = targets already approved and still
+        # ramping, else live telemetry. Used for cross-register checks.
+        setpoints = dict(registers_now)
+        for reg, pending in _pending_commands.items():
+            setpoints[reg] = pending["value"]
+
+        current_state = {
+            "registers": registers_now,
+
+            "setpoints": setpoints,
+
+            "timestamp": _register_settled_since.get(
+                register,
+                _plc_state["timestamp"]
+            ),
         }
 
     # -----------------------------------------------------
@@ -252,6 +385,7 @@ def _handle_downstream_write(
     print(
         f"[MIDDLEWARE] "
         f"{decision['verdict']:4s} "
+        f"src={source_ip} "
         f"{register_name}={value:.2f} "
         f"reason={decision['reason']}"
     )
@@ -264,6 +398,14 @@ def _handle_downstream_write(
     # -----------------------------------------------------
 
     if decision["verdict"] == "DROP":
+
+        _log_blocked(
+            command,
+            cyber_verdict,
+            physical_verdict,
+            decision,
+            current_state["registers"].get(register),
+        )
 
         return
 
@@ -299,6 +441,69 @@ def _handle_downstream_write(
                 register,
                 None
             )
+
+
+# =========================================================
+# PERSISTENT BLOCKED-ATTACK LOG
+# =========================================================
+
+def _log_blocked(
+    command: dict,
+    cyber_verdict: dict,
+    physical_verdict: dict,
+    decision: dict,
+    current_value,
+):
+    """
+    Append a DROPped command to logs/blocked_attacks.jsonl.
+    Never includes the HMAC secret or tag.
+    """
+
+    register = command["register"]
+    machine = MACHINE_BY_REGISTER.get(register, {})
+
+    auth = command.get("auth")
+    if auth is None:
+        signature = "absent"
+    elif auth.get("malformed"):
+        signature = "malformed"
+    else:
+        signature = "present"
+
+    record = {
+        "timestamp": command["timestamp"],
+        "direction": "scada_to_plc",
+        "source_ip": command["source_ip"],
+        "source_port": command.get("source_port"),
+        "tx_id": command["tx_id"],
+        "function_code": command.get("function_code"),
+        "register": register,
+        "register_name": machine.get("name", f"REGISTER_{register}"),
+        "machine": machine.get("machine", f"Unmapped address {register}"),
+        "unit": machine.get("unit", ""),
+        "requested_value": command.get("value"),
+        "current_value": current_value,
+        "signature": signature,
+        "hmac_status": cyber_verdict.get("auth_status", "NOT_CHECKED"),
+        "cyber": {
+            "verdict": "PASS" if cyber_verdict["pass"] else "FAIL",
+            "reason": cyber_verdict["reason"],
+        },
+        "physical": {
+            "verdict": "PASS" if physical_verdict["pass"] else "FAIL",
+            "reason": physical_verdict["reason"],
+        },
+        "orchestrator": {
+            "decision": decision["verdict"],
+            "reason": decision["reason"],
+        },
+        "latency_ms": decision["latency_ms"],
+    }
+
+    try:
+        attack_log.log_blocked_attack(record)
+    except Exception as e:
+        print(f"[MIDDLEWARE] ERROR writing attack log: {e}")
 
 
 # =========================================================
@@ -517,7 +722,7 @@ def _poll_once(
 
         result = _plc_client.read_holding_registers(
             0,
-            count=3
+            count=NUM_REGISTERS
         )
 
         if result.isError():
@@ -704,9 +909,10 @@ def start_middleware_server(
     # Create SCADA-facing datastore
     # -----------------------------------------------------
 
+    # Machine registers 0..N-1 plus the signed-frame window at FRAME_BASE.
     block = MiddlewareDataBlock(
         0,
-        [0] * 3
+        [0] * DATASTORE_SIZE
     )
 
     store = ModbusSlaveContext(
@@ -747,13 +953,26 @@ def start_middleware_server(
         f"{plc_host}:{plc_port}"
     )
 
-    StartTcpServer(
-        context=context,
-        address=(
-            listen_host,
-            listen_port
-        )
+    # Load (or create) the HMAC secret up-front so a bad configuration
+    # fails at startup rather than on the first command.
+    hmac_auth.get_secret()
+
+    print(
+        f"[MIDDLEWARE] Blocked attacks are logged to "
+        f"{attack_log.LOG_FILE}"
     )
+
+    async def _serve():
+        server = SourceTrackingTcpServer(
+            context=context,
+            address=(
+                listen_host,
+                listen_port
+            )
+        )
+        await server.serve_forever()
+
+    asyncio.run(_serve())
 
 
 # =========================================================

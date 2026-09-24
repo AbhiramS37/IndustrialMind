@@ -16,20 +16,21 @@ Additional tests:
 """
 
 import time
-from docs.interfaces import make_command, TANK_PRESSURE, CONVEYOR_SPEED, COOLING_VALVE
+from docs.interfaces import (make_command, MACHINES, TANK_PRESSURE, CONVEYOR_SPEED, COOLING_VALVE,
+                             HEATER_TEMP, FEED_PUMP, RELIEF_VALVE)
 from middleware import physical_agent
 
 SRC = "192.168.1.10"
 NOW = time.time()
 
 # Helper: build a current_state dict as the middleware would receive from plc.get_telemetry()
-def make_state(tank=50.0, conveyor=0.0, valve=45.0, ts=None):
+def make_state(tank=50.0, conveyor=0.0, valve=45.0, ts=None, **extra):
+    regs = {m["register"]: m["initial"] for m in MACHINES}
+    regs.update({TANK_PRESSURE: tank, CONVEYOR_SPEED: conveyor, COOLING_VALVE: valve})
+    for name, v in extra.items():
+        regs[{"heater": HEATER_TEMP, "pump": FEED_PUMP, "relief": RELIEF_VALVE}[name]] = v
     return {
-        "registers": {
-            TANK_PRESSURE:  tank,
-            CONVEYOR_SPEED: conveyor,
-            COOLING_VALVE:  valve,
-        },
+        "registers": regs,
         "timestamp": ts if ts is not None else NOW,
     }
 
@@ -107,6 +108,41 @@ print(f"   verdict: {v6}")
 assert not v6["pass"] and "TELEMETRY_MISMATCH" in v6["reason"], "Test 6 failed"
 
 
+# ── Test 7: Cross-register correlation attack — heater raise, cooling closed ─
+# Each value alone is in range and the heater move is slow enough, but
+# heater 112 C + cooling valve 20 deg is a thermal-runaway combination.
+state7 = make_state(valve=20.0, heater=102.0, ts=NOW - 10.0)
+v7 = physical_agent.check_command(make_command("tx-corr", NOW, SRC, 16, HEATER_TEMP, 112.0), state7)
+print(f"\n7. Correlation attack (heater 102->112 with cooling valve 20): {v7}")
+assert not v7["pass"] and v7["reason"].startswith("CROSS_REGISTER_VIOLATION:THERMAL_RUNAWAY"), "Test 7 failed"
+
+# ── Test 8: Same heater command with cooling open → legitimate, PASS ──────────
+state8 = make_state(valve=60.0, heater=102.0, ts=NOW - 10.0)
+v8 = physical_agent.check_command(make_command("tx-legit", NOW, SRC, 16, HEATER_TEMP, 112.0), state8)
+print(f"\n8. Legit combination (heater 112 with cooling valve 60): {v8}")
+assert v8["pass"], "Test 8 failed"
+
+# ── Test 9: Pending setpoint is used, not stale telemetry ─────────────────────
+# Relief valve telemetry still 40 but an approved setpoint of 10 is ramping;
+# raising the feed pump to 75 must be judged against the 10.
+state9 = make_state(pump=65.0, relief=40.0, ts=NOW - 10.0)
+state9["setpoints"] = dict(state9["registers"]); state9["setpoints"][RELIEF_VALVE] = 10.0
+v9 = physical_agent.check_command(make_command("tx-pend", NOW, SRC, 16, FEED_PUMP, 75.0), state9)
+print(f"\n9. Overpressure via pending setpoint (pump 75, relief heading to 10): {v9}")
+assert not v9["pass"] and "OVERPRESSURE" in v9["reason"], "Test 9 failed"
+
+# ── Test 10: Corrective move out of an unsafe state is allowed ───────────────
+state10 = make_state(pump=80.0, relief=10.0, ts=NOW - 10.0)
+v10 = physical_agent.check_command(make_command("tx-fix", NOW, SRC, 16, FEED_PUMP, 75.0), state10)
+print(f"\n10. Corrective move (pump 80->75 while relief 10): {v10}")
+assert v10["pass"], "Test 10 failed"
+
+# ── Test 11: Existing bounds still apply to new machines ─────────────────────
+v11 = physical_agent.check_command(make_command("tx-oob2", NOW, SRC, 16, HEATER_TEMP, 180.0),
+                                   make_state(ts=NOW - 60.0))
+print(f"\n11. Heater out of bounds (180 C, max 150): {v11}")
+assert not v11["pass"] and "OUT_OF_BOUNDS" in v11["reason"], "Test 11 failed"
+
 print("\n" + "=" * 60)
-print("All 6 tests passed ✓")
+print("All 11 tests passed ✓")
 print("=" * 60)

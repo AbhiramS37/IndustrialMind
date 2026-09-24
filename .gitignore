@@ -1,2 +1,8 @@
 __pycache__/ 
 *.pyc 
+
+# Shared HMAC secret - never commit
+config/hmac_secret.key
+
+# Runtime attack log
+logs/

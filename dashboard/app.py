@@ -12,6 +12,7 @@ PLC -> SCADA:
 No simulated security events.
 """
 
+import ipaddress
 import os
 import sys
 import subprocess
@@ -37,6 +38,12 @@ PROJECT_ROOT = os.path.dirname(
     )
 )
 
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from docs.interfaces import MACHINES  # noqa: E402
+from docs import attack_log  # noqa: E402
+
 app = Flask(__name__)
 
 MAX_EVENTS = 100
@@ -54,11 +61,13 @@ _metrics = {
     "drop": 0,
 }
 
+# One entry per configured machine (docs/interfaces.MACHINES).
 _telemetry = {
-    "TANK_PRESSURE": 50.0,
-    "CONVEYOR_SPEED": 0.0,
-    "COOLING_VALVE": 45.0,
+    m["name"]: float(m["initial"]) for m in MACHINES
 }
+
+# Reads logs/blocked_attacks.jsonl written by the middleware.
+_attack_log_reader = attack_log.AttackLogReader()
 
 
 # =========================================================
@@ -236,11 +245,7 @@ def update_telemetry(registers):
 
     with _lock:
 
-        for name in (
-            "TANK_PRESSURE",
-            "CONVEYOR_SPEED",
-            "COOLING_VALVE",
-        ):
+        for name in _telemetry:
 
             if name in registers:
 
@@ -312,7 +317,8 @@ def _cpu_loop():
 def index():
 
     return render_template(
-        "index.html"
+        "index.html",
+        machines=MACHINES
     )
 
 
@@ -420,6 +426,66 @@ def dashboard_data():
 
 
 # =========================================================
+# BLOCKED IPS (reads logs/blocked_attacks.jsonl)
+# =========================================================
+
+@app.route(
+    "/api/blocked-ips",
+    methods=["GET"]
+)
+def blocked_ips():
+
+    attack_type = request.args.get("attack_type", "")
+    ip_query = request.args.get("ip", "")
+
+    records = _attack_log_reader.records()
+
+    filtered = attack_log.filter_records(
+        records,
+        attack_type=attack_type,
+        ip_query=ip_query
+    )
+
+    return jsonify({
+        "log_file": os.path.relpath(attack_log.LOG_FILE, PROJECT_ROOT),
+        "total_records": len(records),
+        "matching_records": len(filtered),
+        "attack_types": attack_log.attack_type_counts(records),
+        "sources": attack_log.aggregate_by_ip(filtered),
+    })
+
+
+@app.route(
+    "/api/blocked-ips/<path:ip>",
+    methods=["GET"]
+)
+def blocked_ip_detail(ip):
+
+    attack_type = request.args.get("attack_type", "")
+
+    records = [
+        r for r in _attack_log_reader.records()
+        if str(r.get("source_ip")) == ip
+    ]
+
+    records = attack_log.filter_records(
+        records,
+        attack_type=attack_type
+    )
+
+    records.sort(
+        key=lambda r: r.get("timestamp") or 0,
+        reverse=True
+    )
+
+    return jsonify({
+        "source_ip": ip,
+        "count": len(records),
+        "attacks": records[:500],
+    })
+
+
+# =========================================================
 # ATTACK TRIGGER
 # =========================================================
 
@@ -445,7 +511,25 @@ def trigger_attack():
         "impossible-command",
         "replay",
         "false-injection",
+        "cross-register",
+        "hmac-missing",
+        "hmac-tamper",
+        "hmac-forged",
+        "delayed-replay",
     }
+
+    # Optional local address(es) for the attacker socket to bind to.
+    # The middleware still records whatever address the connection
+    # actually comes from.
+    source_ip = str(data.get("source_ip") or "").strip()
+    for ip in filter(None, (x.strip() for x in source_ip.split(","))):
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return jsonify({
+                "success": False,
+                "error": f"Invalid source IP: {ip}"
+            }), 400
 
     if attack not in allowed:
 
@@ -456,13 +540,18 @@ def trigger_attack():
 
     try:
 
+        cmd = [
+            sys.executable,
+            "-m",
+            "attacker.attacker",
+            attack
+        ]
+
+        if source_ip:
+            cmd += ["--source-ip", source_ip]
+
         subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "attacker.attacker",
-                attack
-            ],
+            cmd,
             cwd=PROJECT_ROOT
         )
 
@@ -513,17 +602,8 @@ def reset_dashboard():
         _metrics["pass"] = 0
         _metrics["drop"] = 0
 
-        _telemetry[
-            "TANK_PRESSURE"
-        ] = 50.0
-
-        _telemetry[
-            "CONVEYOR_SPEED"
-        ] = 0.0
-
-        _telemetry[
-            "COOLING_VALVE"
-        ] = 45.0
+        for m in MACHINES:
+            _telemetry[m["name"]] = float(m["initial"])
 
         _event_counter = 0
         _tx_id_map.clear()

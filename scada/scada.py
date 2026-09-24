@@ -5,6 +5,11 @@ SCADA operator simulation.
 
 Sends one Modbus write every 2 seconds to the middleware.
 
+Every command is an HMAC-SHA256 signed frame (Modbus FC16 to FRAME_BASE,
+see docs/hmac_auth.py). The shared secret comes from IM_HMAC_SECRET /
+IM_HMAC_SECRET_FILE / config/hmac_secret.key - the same source the
+middleware uses.
+
 Flow:
     SCADA -> Middleware :5021 -> PLC :5020
 """
@@ -16,16 +21,18 @@ import uuid
 
 from pymodbus.client import ModbusTcpClient
 
-from docs.interfaces import REGISTER_MAP
+from docs.interfaces import REGISTER_MAP, MACHINES, NUM_REGISTERS, FRAME_BASE, from_raw
+from docs import hmac_auth
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-SCADA_SOURCE_IP = "192.168.1.10"
+# The source IP seen by the middleware is the real address of this
+# process's TCP connection; it is not configured here.
 
-FUNCTION_CODE = 6
+FUNCTION_CODE = 16   # signed frames use write-multiple-registers
 SCALE = 10
 
 COMMAND_INTERVAL = 2.0
@@ -35,33 +42,60 @@ COMMAND_INTERVAL = 2.0
 # OPERATOR PROFILES
 # ============================================================
 
+# Built from the central machine config (docs/interfaces.MACHINES).
 OPERATOR_PROFILES = {
-    "pressure": {
-        "register": 0,
-        "target": 60.0,
-        "step": 1.0,
-        "current": 50.0,
-    },
-
-    "conveyor": {
-        "register": 1,
-        "target": 80.0,
-        "step": 2.0,
-        "current": 0.0,
-    },
-
-    "valve": {
-        "register": 2,
-        "target": 60.0,
-        "step": 1.0,
-        "current": 45.0,
-    },
+    m["name"]: {
+        "register": m["register"],
+        "target": float(m["operator"]["target"]),
+        "step": float(m["operator"]["step"]),
+        "current": float(m["initial"]),
+    }
+    for m in MACHINES
 }
 
 
 # ============================================================
 # SETPOINT GENERATION
 # ============================================================
+
+def _sync_with_plant(name, actual):
+    """
+    If something else moved the plant well away from the operator's own
+    setpoint (another operator, an attack that got through, a reset), the
+    operator continues from the ACTUAL reading instead of issuing a large
+    jump back to a stale value.
+    """
+
+    if actual is None:
+        return
+
+    profile = OPERATOR_PROFILES[name]
+
+    if abs(actual - profile["current"]) > 2 * profile["step"]:
+        profile["current"] = actual
+
+
+def _read_plant(client):
+    """Read the live plant values the middleware mirrors from the PLC."""
+
+    try:
+        result = client.read_holding_registers(
+            0,
+            count=NUM_REGISTERS,
+            slave=1
+        )
+
+        if result.isError():
+            return {}
+
+        return {
+            m["name"]: from_raw(raw)
+            for m, raw in zip(MACHINES, result.registers)
+        }
+
+    except Exception:
+        return {}
+
 
 def _next_setpoint(name):
     """
@@ -111,10 +145,15 @@ def _to_raw(register, value):
 
 def send_write(client, register, value):
     """
-    Send one holding-register write to middleware.
+    Send one HMAC-signed command frame to middleware.
     """
 
     raw_value = _to_raw(register, value)
+
+    frame = hmac_auth.build_frame(
+        register,
+        raw_value / SCALE
+    )
 
     tx_id = str(uuid.uuid4())[:8]
 
@@ -128,9 +167,9 @@ def send_write(client, register, value):
     )
 
     try:
-        result = client.write_register(
-            address=register,
-            value=raw_value,
+        result = client.write_registers(
+            address=FRAME_BASE,
+            values=frame,
             slave=1
         )
 
@@ -168,6 +207,9 @@ def run_operator_loop(host="127.0.0.1", port=5021):
     Exactly ONE command is sent every 2 seconds.
     """
 
+    # Fail fast if the shared HMAC secret is misconfigured.
+    hmac_auth.get_secret()
+
     client = ModbusTcpClient(
         host,
         port=port
@@ -195,11 +237,9 @@ def run_operator_loop(host="127.0.0.1", port=5021):
     print("[SCADA] Press Ctrl-C to stop.")
     print()
 
-    # Rotate through the three plant parameters.
+    # Rotate through every configured machine.
     registers = [
-        "pressure",
-        "conveyor",
-        "valve",
+        m["name"] for m in MACHINES
     ]
 
     index = 0
@@ -213,6 +253,11 @@ def run_operator_loop(host="127.0.0.1", port=5021):
             profile = OPERATOR_PROFILES[name]
 
             register = profile["register"]
+
+            _sync_with_plant(
+                name,
+                _read_plant(client).get(name)
+            )
 
             value = _next_setpoint(name)
 

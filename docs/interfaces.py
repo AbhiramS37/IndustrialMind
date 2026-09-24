@@ -1,27 +1,173 @@
 # docs/interfaces.py
+#
+# Shared contract for every component (PLC, middleware, agents, SCADA,
+# attacker, dashboard, evaluation).
+#
+# MACHINES is the SINGLE source of truth for the plant. Every other module
+# derives its registers, bounds, ramp rates, telemetry fields and operator
+# profiles from this list, so adding/removing a machine is a one-place edit.
+
+# ---------------------------------------------------------------------------
+# Register numbers (kept as named constants for backwards compatibility)
+# ---------------------------------------------------------------------------
 
 TANK_PRESSURE = 0
 CONVEYOR_SPEED = 1
 COOLING_VALVE = 2
+HEATER_TEMP = 3
+FEED_PUMP = 4
+RELIEF_VALVE = 5
 
+# Registers travel on the wire as unsigned 16-bit ints with one decimal of
+# precision: raw = round(value * SCALE).
+SCALE = 10
+
+# ---------------------------------------------------------------------------
+# Machine configuration
+#
+#   register        Modbus holding-register address
+#   name            register / telemetry key
+#   machine         human-readable machine name (dashboard + logs)
+#   label           short telemetry label
+#   min, max, unit  physical safe range
+#   initial         start value in the PLC simulation
+#   rate_per_sec    how fast the real actuator can move (PLC physics)
+#   sig_move        "significant move" threshold used by cross-register rules
+#   operator        SCADA operator profile: target setpoint and step size
+#   bar_class       existing dashboard progress-bar colour class
+# ---------------------------------------------------------------------------
+
+MACHINES = [
+    {
+        "register": TANK_PRESSURE, "name": "TANK_PRESSURE",
+        "machine": "M1 Pressure Tank", "label": "Tank Pressure",
+        "min": 0, "max": 100, "unit": "PSI",
+        "initial": 50.0, "rate_per_sec": 2.0, "sig_move": 10.0,
+        "operator": {"target": 60.0, "step": 1.0},
+        "bar_class": "",
+    },
+    {
+        "register": CONVEYOR_SPEED, "name": "CONVEYOR_SPEED",
+        "machine": "M2 Conveyor Drive", "label": "Conveyor Speed",
+        "min": 0, "max": 120, "unit": "RPM",
+        "initial": 0.0, "rate_per_sec": 10.0, "sig_move": 20.0,
+        "operator": {"target": 80.0, "step": 2.0},
+        "bar_class": "warning",
+    },
+    {
+        "register": COOLING_VALVE, "name": "COOLING_VALVE",
+        "machine": "M3 Cooling Valve", "label": "Cooling Valve",
+        "min": 0, "max": 90, "unit": "deg",
+        "initial": 45.0, "rate_per_sec": 5.0, "sig_move": 15.0,
+        "operator": {"target": 60.0, "step": 1.0},
+        "bar_class": "info",
+    },
+    {
+        "register": HEATER_TEMP, "name": "HEATER_TEMP",
+        "machine": "M4 Reactor Heater", "label": "Heater Temperature",
+        "min": 0, "max": 150, "unit": "C",
+        "initial": 60.0, "rate_per_sec": 5.0, "sig_move": 20.0,
+        "operator": {"target": 80.0, "step": 1.0},
+        "bar_class": "warning",
+    },
+    {
+        "register": FEED_PUMP, "name": "FEED_PUMP",
+        "machine": "M5 Feed Pump", "label": "Feed Pump Rate",
+        "min": 0, "max": 100, "unit": "%",
+        "initial": 40.0, "rate_per_sec": 5.0, "sig_move": 15.0,
+        "operator": {"target": 55.0, "step": 1.0},
+        "bar_class": "",
+    },
+    {
+        "register": RELIEF_VALVE, "name": "RELIEF_VALVE",
+        "machine": "M6 Pressure Relief Valve", "label": "Relief Valve",
+        "min": 0, "max": 90, "unit": "deg",
+        "initial": 45.0, "rate_per_sec": 5.0, "sig_move": 15.0,
+        "operator": {"target": 50.0, "step": 1.0},
+        "bar_class": "info",
+    },
+]
+
+MACHINE_BY_REGISTER = {m["register"]: m for m in MACHINES}
+MACHINE_BY_NAME = {m["name"]: m for m in MACHINES}
+
+ALL_REGISTERS = tuple(m["register"] for m in MACHINES)
+NUM_REGISTERS = len(MACHINES)
+
+# Backwards-compatible view used throughout the original code base.
 REGISTER_MAP = {
-    TANK_PRESSURE: {"name": "TANK_PRESSURE", "min": 0, "max": 100, "unit": "PSI"},
-    CONVEYOR_SPEED: {"name": "CONVEYOR_SPEED", "min": 0, "max": 120, "unit": "RPM"},
-    COOLING_VALVE: {"name": "COOLING_VALVE", "min": 0, "max": 90, "unit": "deg"},
+    m["register"]: {"name": m["name"], "min": m["min"], "max": m["max"], "unit": m["unit"]}
+    for m in MACHINES
 }
 
-def make_command(tx_id, timestamp, source_ip, function_code, register, value):
+# ---------------------------------------------------------------------------
+# Cross-register correlation rules (Physical Agent)
+#
+# Each rule describes a COMBINED plant state that is unsafe even though each
+# individual value is inside its own safe range. A command is dropped when
+# applying it to the projected plant setpoints makes ALL conditions true.
+#   condition = (register, operator, threshold), operator in {">=", "<="}
+# ---------------------------------------------------------------------------
+
+CROSS_REGISTER_RULES = [
+    {
+        "id": "THERMAL_RUNAWAY",
+        "description": "heater setpoint high while cooling valve nearly closed - heat cannot be removed",
+        "conditions": [(HEATER_TEMP, ">=", 110.0), (COOLING_VALVE, "<=", 25.0)],
+    },
+    {
+        "id": "OVERPRESSURE",
+        "description": "feed pump driving flow into tank while relief valve nearly closed - tank cannot vent",
+        "conditions": [(FEED_PUMP, ">=", 70.0), (RELIEF_VALVE, "<=", 15.0)],
+    },
+    {
+        "id": "HOT_PRESSURIZED_VESSEL",
+        "description": "tank pressure and heater temperature both near limits at the same time",
+        "conditions": [(TANK_PRESSURE, ">=", 85.0), (HEATER_TEMP, ">=", 125.0)],
+    },
+]
+
+# ---------------------------------------------------------------------------
+# Signed command frame (SCADA -> Middleware, Modbus FC16)
+#
+# A write-multiple-registers request to FRAME_BASE carrying:
+#   [0]      frame version (1)
+#   [1]      target machine register
+#   [2]      raw value (value * SCALE)
+#   [3..6]   64-bit nonce        (4 x 16-bit, big-endian)
+#   [7..10]  64-bit timestamp ms (4 x 16-bit, big-endian)
+#   [11..26] HMAC-SHA256 tag     (16 x 16-bit = 32 bytes)
+# ---------------------------------------------------------------------------
+
+FRAME_BASE = 100
+FRAME_VERSION = 1
+FRAME_LEN = 27
+DATASTORE_SIZE = FRAME_BASE + FRAME_LEN
+
+
+def make_command(tx_id, timestamp, source_ip, function_code, register, value,
+                 raw_value=None, auth=None, source_port=None):
+    """Command dict passed to the agents.
+
+    auth: None when the command arrived without a signed frame, otherwise the
+          parsed frame fields (see docs/hmac_auth.parse_frame).
+    """
     return {
         "tx_id": tx_id,
         "timestamp": timestamp,
         "source_ip": source_ip,
+        "source_port": source_port,
         "function_code": function_code,
         "register": register,
         "value": value,
+        "raw_value": raw_value,
+        "auth": auth,
     }
+
 
 def make_verdict(tx_id, passed, reason, agent):
     return {"tx_id": tx_id, "pass": passed, "reason": reason, "agent": agent}
+
 
 def make_decision(tx_id, verdict, reason, latency_ms, direction):
     return {
@@ -31,3 +177,13 @@ def make_decision(tx_id, verdict, reason, latency_ms, direction):
         "latency_ms": latency_ms,
         "direction": direction,  # "downstream" or "upstream"
     }
+
+
+def to_raw(value):
+    """Engineering value -> 16-bit register value."""
+    return max(0, min(65535, int(round(float(value) * SCALE))))
+
+
+def from_raw(raw):
+    """16-bit register value -> engineering value."""
+    return raw / SCALE
